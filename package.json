@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/generate-analytics-doc.mjs",
     "build": "vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "docs:analytics": "node scripts/generate-analytics-doc.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",

@@ -9,6 +9,7 @@
 // =====================================================================
 import React, { useState, useEffect, useRef, useMemo, useContext, createContext } from "react";
 import { supabase } from "./supabaseClient";
+import { track } from "./track";
 
 // [DS-TOKEN 구현 규칙] v2.7 개정(발견 93) — Tailwind Play CDN 스크립트와 Geist 폰트를 app.js가
 // 직접 부트스트랩한다. 이전에는 index.html에 <script src="cdn.tailwindcss.com">가 미리 존재해야
@@ -182,6 +183,8 @@ function buildSeedData() {
     extensionUpdatedIds: [],  // v2.7 신설: 기간 확장(periodExtendedFrom) 이후 실제로 재제출한 멤버 id — 제출 현황 재대기, 발견 86
     cancelReason: null,       // v2.3: 회의 취소 사유 (선택) [PRD-CANCEL-MEETING]
     blockReasons: {},
+    launchedAt: null,         // 추적: meeting_confirmed의 days_to_confirm 계산용
+    conflictEnteredAt: null,  // 추적: rematch_completed의 days_to_rematch 계산용
     members: [
       { id: "m1", name: "", email: "", role: "HOST", attendance: "REQUIRED", status: "PENDING" },
     ],
@@ -1620,6 +1623,10 @@ export default function App() {
       if (error || !data) return; // 잘못된 링크거나 아직 동기화 전 — 로컬 상태 그대로 둔다
       setMeeting(data.data);
       setCurrentPath(mine ? "/host/dashboard" : "/attendee");
+      if (!mine) {
+        sessionStorage.setItem("meetsync_link_opened_at", String(Date.now())); // availability_submitted의 response_delay_hours 계산용
+        track("invite_link_opened", mId, {});
+      }
     });
   }, []); // eslint-disable-line — 최초 마운트 시점의 로컬 캐시와만 비교해야 하므로 의도적으로 1회만
 
@@ -1639,10 +1646,12 @@ export default function App() {
   const nudge = (ids) => { // 독촉 — 발송 기록 커밋 ⑧
     setMeeting((prev) => commitMeeting({ ...prev, nudgedIds: [...new Set([...prev.nudgedIds, ...ids])] }));
     showToast("다시 알림을 보냈어요");
+    track("mitigation_triggered", meeting.meetingId, { type: "NUDGE" });
   };
   const sendReRequest = (targets) => { // 재요청 — 커밋 ⑧ (targets: {id,name}[])
     setMeeting((prev) => commitMeeting({ ...prev, reRequestedIds: [...new Set([...prev.reRequestedIds, ...targets.map((t) => t.id)])] }));
     showToast(`${targets.map((t) => t.name).join(", ")}님에게 다시 요청했어요`);
+    track("mitigation_triggered", meeting.meetingId, { type: "RE_REQUEST" });
   };
   const demoteMember = (id, slotKey, note) => { // 강등 — 커밋 ⑦. v2.3: 의견 남기기(note) 인자 추가
     setMeeting((prev) => {
@@ -1658,11 +1667,13 @@ export default function App() {
       });
     });
     setConfirmOpen(null);
+    track("mitigation_triggered", meeting.meetingId, { type: "DEMOTE" });
   };
   // v2.3 신규 — 회의 폐기 [PRD-CANCEL-MEETING]
   const cancelMeeting = (reason) => {
     setMeeting(commitMeeting({ ...meeting, status: "CANCELLED", cancelReason: reason || null })); // ⑩
     setConfirmOpen(null);
+    track("meeting_cancelled", meeting.meetingId, { reason: reason || null });
   };
   // v2.3 신규 — 역강등 요청 4종 [PRD-PROMOTE-REQUEST], v2.5부터 공용 순수 함수(upsertRequest 등) 사용
   const requestPromotion = (id, reason) => {
@@ -1725,6 +1736,7 @@ export default function App() {
       extensionUpdatedIds: [], // v2.7(발견 86) — 새 확장 세션 시작, 이전 확장의 재제출 기록 리셋
     })); // ⑫
     showToast("조율 기간을 넓혔어요 — 다시 계산할게요");
+    track("mitigation_triggered", meeting.meetingId, { type: "EXTEND_PERIOD" });
   };
   const cancelAttendance = (id) => { // 참석 취소 (PRD 5.5 경로 A — v1.6 재설계: 슬롯 단위 거절, 연산 제외 폐지) + [PRD-REMATCH] 6-2C 취소=대안선택 강제(발견 89)
     const m = meeting.members.find((x) => x.id === id);
@@ -1742,9 +1754,11 @@ export default function App() {
         // droppedMemberId로 별도 처리한다. 여기서 [id]로 미리 채우면 바로 아래에서 강제 진입하는 QUICK 화면이
         // "이미 반영 완료"로 뜨며 대체 시간을 고를 수 없게 되므로, 실제 QUICK/GRID 응답 전까지는 비워둔다.
         reMatchUpdatedIds: [],
+        conflictEnteredAt: new Date().toISOString(), // 추적: rematch_completed의 days_to_rematch 계산용
       }); // ③ + 초기화
       setMeeting(next);
       showAlertBanner(`${m.name}님이 참석을 취소했습니다.`, "EX05");
+      track("attendance_cancelled", meeting.meetingId, { dropout_reason: "SELF_CANCEL" });
       // v2.4 개정(발견 89) — 취소=대안선택 강제: 대기 화면을 거치지 않고 곧바로 원클릭/그리드로 진입한다.
       // canQuickReconfirm(등)은 이전 렌더의 stale 클로저이므로, 방금 만든 next를 기준으로 직접 재계산한다.
       const nextTop3 = calculateBestTime(next.availability, next.members, { excludeIds: [], slots: activeSlots(next.candidatePeriod) });
@@ -1774,6 +1788,7 @@ export default function App() {
     setMeeting(commitMeeting({ ...meeting, forceClosed: true }));
     setConfirmOpen(null);
     showToast("아직 답 없는 사람을 빼고 결과를 계산해요");
+    track("mitigation_triggered", meeting.meetingId, { type: "FORCE_CLOSE" });
   };
 
   // ---- 초기화 ----
@@ -1795,6 +1810,8 @@ export default function App() {
   const handleConfirmMeeting = (slotKey) => {
     setConfirmOpen(null);
     setSyncChecking(true);
+    const wasConflict = meeting.status === "CONFLICT"; // 클로저 시점(업데이트 전) 상태 — 재조율 확정인지 판별
+    const level = (top3.find((s) => s.slotKey === slotKey) || rematchTop3.find((s) => s.slotKey === slotKey) || {}).level;
     setTimeout(() => {
       setSyncChecking(false);
       // v2.4 (발견 73 근본 정리): 재확정 성공 시 이전 CONFLICT의 잔재(droppedMemberId·dropReason)를 지운다.
@@ -1806,16 +1823,27 @@ export default function App() {
       clearBannerByCause("EX05");
       const absent = deriveAbsentees(next).length + next.declinedOptionalIds.length;
       showToast(absent === 0 ? "전원 캘린더에 등록되었습니다" : `참석 가능 인원(${next.members.length - absent}명)의 캘린더에 등록되었습니다`);
+      const daysToConfirm = meeting.launchedAt ? (Date.now() - new Date(meeting.launchedAt).getTime()) / 86400000 : null;
+      track("meeting_confirmed", meeting.meetingId, { level: level ?? null, days_to_confirm: daysToConfirm });
+      if (wasConflict) {
+        const daysToRematch = meeting.conflictEnteredAt ? (Date.now() - new Date(meeting.conflictEnteredAt).getTime()) / 86400000 : null;
+        track("rematch_completed", meeting.meetingId, { days_to_rematch: daysToRematch });
+      }
     }, 800);
   };
 
   // ---- 발의 (커밋: launched) ----
   const launchMeeting = () => {
-    setMeeting(commitMeeting({ ...meeting, launched: true }));
+    const launchedAt = new Date().toISOString();
+    setMeeting(commitMeeting({ ...meeting, launched: true, launchedAt }));
     // 새로고침해도 같은 회의로 돌아오도록, 그리고 링크가 실제로 이 회의를 가리키도록 주소에 반영한다.
     window.history.replaceState(null, "", `?m=${meeting.meetingId}`);
     showToast("초대 링크가 생성되었습니다");
     setCurrentPath("/host/dashboard");
+    track("meeting_created", meeting.meetingId, {
+      member_count: meeting.members.length,
+      candidate_days: activeDates(meeting.candidatePeriod).length,
+    });
   };
 
   // ---- 제출 (커밋 ①) — CONFLICT 중 업데이트 겸용 ----
@@ -1830,6 +1858,8 @@ export default function App() {
   };
   const submitAvailability = (skipProactive) => {
     const buffer = tempGrid[currentMemberId] || {};
+    const openedAt = Number(sessionStorage.getItem("meetsync_link_opened_at")) || null;
+    const responseDelayHours = openedAt ? (Date.now() - openedAt) / 3600000 : null;
     // 최초 제출(신규)에만 적용 — lateJoin·CONFLICT 재편집은 이미 다른 사유로 진행 중이라 제외
     if (!skipProactive && !lateJoinId && meeting.status === "PROGRESS" && attendeeStage === "GRID") {
       const offer = checkProactiveNudge(buffer);
@@ -1854,15 +1884,18 @@ export default function App() {
         showToast("이 시간에 참석 가능하신 걸로 기록했어요");
       } else {
         // 확정된 시간에 안 됨 — 이제서야 정당하게 재조율 필요. "취소"가 아니므로 사유를 구분해서 기록
-        const withConflict = { ...next, status: "CONFLICT", droppedMemberId: lateJoinId, dropReason: "LATE_MISMATCH", declinedOptionalIds: [], reMatchUpdatedIds: [lateJoinId] }; // v2.7 정정(발견 84) — 이 제출 자체가 본인 갱신
+        const withConflict = { ...next, status: "CONFLICT", droppedMemberId: lateJoinId, dropReason: "LATE_MISMATCH", declinedOptionalIds: [], reMatchUpdatedIds: [lateJoinId], conflictEnteredAt: new Date().toISOString() }; // v2.7 정정(발견 84) — 이 제출 자체가 본인 갱신
         setMeeting(commitMeeting(withConflict));
         showAlertBanner(`${meeting.members.find((m) => m.id === lateJoinId).name}님이 응답을 제출했는데 확정된 시간에 참석이 어려워 재조율이 필요해요.`, "EX05");
         setLateJoinId(null);
+        track("attendance_cancelled", meeting.meetingId, { dropout_reason: "LATE_MISMATCH" });
       }
+      track("availability_submitted", meeting.meetingId, { response_delay_hours: responseDelayHours, is_resubmit: false });
       return;
     }
     setMeeting(commitMeeting(next));
-    if (meeting.status === "CONFLICT") {
+    const isResubmit = meeting.status === "CONFLICT";
+    if (isResubmit) {
       preCancelSnapshot.current = null; // v2.4(발견 89) — 새 시간을 실제로 제출했으니 되돌릴 대상 없음
       setConflictEdit(null);
       showToast("업데이트되었습니다 — 대체안에 즉시 반영됩니다");
@@ -1870,6 +1903,7 @@ export default function App() {
       setAttendeeStage("DONE");
       showToast("시간을 제출했어요");
     }
+    track("availability_submitted", meeting.meetingId, { response_delay_hours: responseDelayHours, is_resubmit: isResubmit });
   };
 
   // ---- 그리드 편집 (4상태 순환) ----
