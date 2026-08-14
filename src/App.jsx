@@ -8,6 +8,7 @@
 // JSX·로직 자체는 이 리팩터 전후로 동일 — React DevTools 가시성/컴포넌트 단위 최적화 확보가 목적.
 // =====================================================================
 import React, { useState, useEffect, useRef, useMemo, useContext, createContext } from "react";
+import { supabase } from "./supabaseClient";
 
 // [DS-TOKEN 구현 규칙] v2.7 개정(발견 93) — Tailwind Play CDN 스크립트와 Geist 폰트를 app.js가
 // 직접 부트스트랩한다. 이전에는 index.html에 <script src="cdn.tailwindcss.com">가 미리 존재해야
@@ -196,6 +197,13 @@ function commitMeeting(next) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch (e) { /* 저장 실패해도 화면 상태 자체는 계속 진행 — 다음 커밋에서 재시도됨 */ }
+  // 발의된 회의만 Supabase에 올린다 — 발의 전엔 아직 다른 사람과 공유할 대상 자체가 없다.
+  // fire-and-forget: 실패해도(오프라인 등) 로컬 상태·localStorage는 이미 최신이라 화면은 계속 진행된다.
+  if (next.launched) {
+    supabase.from("meetings").upsert({ id: next.meetingId, data: next, updated_at: new Date().toISOString() }).then(({ error }) => {
+      if (error) console.error("Supabase 저장 실패:", error.message);
+    });
+  }
   return next;
 }
 function loadInitialState() {
@@ -1303,7 +1311,7 @@ function HostDashboardScreen() {
     meeting, resetMeeting, confirmOpen, setConfirmOpen, submittedCount, dl, top3, syncChecking, nameOf,
     rejectPromotionRequest, approvePromotionRequest, rejectReinstateRequest, approveReinstateRequest,
     showToast, navigate, cancelReasonDraft, setCancelReasonDraft, cancelMeeting, nudge, forceCloseExec,
-    registrationCopy,
+    registrationCopy, inviteLink,
   } = useApp();
 
   if (meeting.status === "CANCELLED") { // v2.3 — 최우선 가드
@@ -1390,10 +1398,10 @@ function HostDashboardScreen() {
       )}
       <div className={`${T.card} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-2`}>
         <span className={`${T.mutedForeground} text-xs`}>초대 링크</span>
-        <span className={`${T.foreground} text-sm font-mono break-all`}>meetsync.app/m/{meeting.meetingId}</span>
+        <span className={`${T.foreground} text-sm font-mono break-all`}>{inviteLink}</span>
         <div className="flex gap-2">
           <button className={`${T.card} ${T.border} ${T.foreground} px-3 py-1.5 ${T.roundedElement} border text-xs ${T.pressed}`}
-            onClick={() => showToast("링크가 복사되었습니다")}>링크 복사</button>
+            onClick={() => { navigator.clipboard?.writeText(inviteLink); showToast("링크가 복사되었습니다"); }}>링크 복사</button>
           <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs font-bold ${T.pressed}`}
             onClick={() => navigate("/attendee")}>링크 열어보기</button>
         </div>
@@ -1591,7 +1599,7 @@ export default function App() {
     if (meeting.status !== "CONFLICT") setConflictEdit(null);
   }, [meeting.status]);
 
-  // ---- [DEV-SYNC] 멀티탭 동기화 ----
+  // ---- [DEV-SYNC] 멀티탭 동기화 (같은 브라우저, localStorage 기반) ----
   useEffect(() => {
     const onStorage = (e) => {
       if (e.key !== STORAGE_KEY) return;
@@ -1601,6 +1609,30 @@ export default function App() {
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, []);
+
+  // ---- 공유 링크(?m=)로 들어온 회의를 Supabase에서 불러온다 ----
+  // mine: 이 브라우저가 직접 만든(발의한) 회의면 주최자 대시보드로, 남이 공유한 링크로 처음 들어왔으면 참석자 화면으로.
+  useEffect(() => {
+    const mId = new URLSearchParams(window.location.search).get("m");
+    if (!mId) return;
+    const mine = mId === meeting.meetingId && meeting.launched;
+    supabase.from("meetings").select("data").eq("id", mId).single().then(({ data, error }) => {
+      if (error || !data) return; // 잘못된 링크거나 아직 동기화 전 — 로컬 상태 그대로 둔다
+      setMeeting(data.data);
+      setCurrentPath(mine ? "/host/dashboard" : "/attendee");
+    });
+  }, []); // eslint-disable-line — 최초 마운트 시점의 로컬 캐시와만 비교해야 하므로 의도적으로 1회만
+
+  // ---- Supabase 실시간 동기화 (다른 기기·다른 브라우저 포함) ----
+  useEffect(() => {
+    if (!meeting.launched || !meeting.meetingId) return;
+    const channel = supabase
+      .channel(`meeting-${meeting.meetingId}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "meetings", filter: `id=eq.${meeting.meetingId}` },
+        (payload) => { if (payload.new?.data) setMeeting(payload.new.data); })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [meeting.launched, meeting.meetingId]);
 
 
   // ---- [DEV-EXIT] 배제 3경로 핸들러 (PRD 2.7) ----
@@ -1780,6 +1812,8 @@ export default function App() {
   // ---- 발의 (커밋: launched) ----
   const launchMeeting = () => {
     setMeeting(commitMeeting({ ...meeting, launched: true }));
+    // 새로고침해도 같은 회의로 돌아오도록, 그리고 링크가 실제로 이 회의를 가리키도록 주소에 반영한다.
+    window.history.replaceState(null, "", `?m=${meeting.meetingId}`);
     showToast("초대 링크가 생성되었습니다");
     setCurrentPath("/host/dashboard");
   };
@@ -1926,6 +1960,9 @@ export default function App() {
   };
   const heatmap = useMemo(() => buildHeatmap(meeting), [meeting]);
   const hostName = meeting.members.find((m) => m.role === "HOST").name;
+  const inviteLink = typeof window !== "undefined"
+    ? `${window.location.origin}${window.location.pathname}?m=${meeting.meetingId}`
+    : "";
   const step = deriveStep(meeting, currentPath);
   const isProductScreen = ["/host/create", "/attendee", "/host/dashboard", "/host/re-match"].includes(currentPath);
   const isHostScreen = ["/host/dashboard", "/host/re-match"].includes(currentPath); // v1.6 — PRD 1.5 배너 범위
@@ -1977,7 +2014,7 @@ export default function App() {
     checkProactiveNudge, submitAvailability,
     selectMember, cycleState, paintSlot, onSlotDown, onSlotEnter, onGridTouchMove, fillRemaining, fillDayUnavailable,
     dl, submittedCount, top3, currentTop3Ref, rematchTop3, quickReconfirmSlot, canQuickReconfirm, heatmap, hostName, step,
-    isProductScreen, isHostScreen, nameOf, registrationCopy,
+    isProductScreen, isHostScreen, nameOf, registrationCopy, inviteLink,
   };
 
   return (
