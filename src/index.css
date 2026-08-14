@@ -1,0 +1,16 @@
+/* App.jsx가 Tailwind CDN + Geist 폰트를 직접 부트스트랩하므로,
+   여기서는 브라우저 기본 여백만 제거하고 나머지는 Tailwind에 맡긴다. */
+:root {
+  /* v2.9 정정(발견 98) — light dark로 두면 배경은 흰색 고정인데 날짜·시간 input의
+     네이티브 달력/시계 아이콘만 다크 배색으로 그려져 흰 배경에 거의 안 보였다.
+     이 앱은 다크 모드를 지원하지 않는 고정 라이트 디자인이므로 명시적으로 light만 선언한다. */
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+}
+
+#root {
+  min-height: 100svh;
+}
