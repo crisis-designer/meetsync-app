@@ -145,13 +145,20 @@ const FULL_DATES = buildFullDates();
 // 실제 "오늘"이 지나가면서 FULL_DATES의 롤링 윈도우 밖으로 밀려난 과거 날짜의 요일이 빈 문자열로 새는 문제가 있었다.
 const dayLabelOf = (d) => DAY_NAMES[new Date(`${d}T00:00:00`).getDay()];
 const HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17];
-// 발의 화면 드롭다운(30분/1시간/1시간 30분/2시간 "단위")의 표시용 매핑 + 실제 분 단위.
+// 회의 시간은 정해진 몇 개 중 고르는 게 아니라 분 단위로 자유 입력(meeting.durationMinutes, 시간+분 입력).
 // 그리드 자체는 항상 09~17시 1시간 슬롯 고정이지만(전 회의 공통 — 알고리즘 단순성·유연성 유지),
 // 회의 시간이 1시간을 넘으면 "몇 개의 연속 슬롯이 전원 비어야 하는지"(neededSlotsFor)를 계산해
 // 추천 알고리즘이 실제로 그 길이만큼 연속 가능 여부를 확인하고, 확정 시각도 정확한 종료 시각으로 표시한다.
-const DURATION_LABEL_TEXT = { "30m": "30분", "1h": "1시간", "1h30m": "1시간 30분", "2h": "2시간" };
-const DURATION_MINUTES = { "30m": 30, "1h": 60, "1h30m": 90, "2h": 120 };
-const neededSlotsFor = (durationLabel) => Math.ceil((DURATION_MINUTES[durationLabel] || 60) / 60);
+const DEFAULT_DURATION_MINUTES = 60;
+const MAX_DURATION_MINUTES = 480; // 그리드가 09~17시(9칸)라 하루 안에서 잡을 수 있는 최대치로 넉넉히 제한
+const fmtDuration = (minutes) => {
+  const m = minutes || DEFAULT_DURATION_MINUTES;
+  const h = Math.floor(m / 60), mm = m % 60;
+  if (h && mm) return `${h}시간 ${mm}분`;
+  if (h) return `${h}시간`;
+  return `${mm}분`;
+};
+const neededSlotsFor = (minutes) => Math.ceil((minutes || DEFAULT_DURATION_MINUTES) / 60);
 const slotKeyOf = (date, h) => `${date}T${String(h).padStart(2, "0")}:00`;
 const FULL_ALL_SLOTS = FULL_DATES.flatMap((d) => HOURS.map((h) => slotKeyOf(d, h)));
 // 시작 슬롯(startSk)부터 neededSlots개 연속 슬롯 — 그 날짜의 HOURS 범위를 넘어가면(다음날로 스필오버)
@@ -187,10 +194,10 @@ function spanBlockReason(av, memberId, span) {
 }
 // 확정 슬롯의 실제 종료 시각 — neededSlots(정수 시간 칸)와 달리 분 단위 실제 길이를 그대로 반영한다
 // (예: 1시간 30분 회의는 칸은 2개 쓰지만 종료는 시작+90분이지 +2시간이 아니다).
-function endTimeOf(startSk, durationLabel) {
+function endTimeOf(startSk, minutes) {
   const [date, t] = startSk.split("T");
   const startMin = parseInt(t.slice(0, 2), 10) * 60 + parseInt(t.slice(3, 5), 10);
-  const endMin = startMin + (DURATION_MINUTES[durationLabel] || 60);
+  const endMin = startMin + (minutes || DEFAULT_DURATION_MINUTES);
   const eh = Math.floor(endMin / 60) % 24, em = endMin % 60;
   return { date, time: `${String(eh).padStart(2, "0")}:${String(em).padStart(2, "0")}` };
 }
@@ -205,9 +212,9 @@ const fmtSlot = (sk) => {
   return `${d.slice(5, 7)}/${d.slice(8, 10)} (${dayLabelOf(d)}) ${t}`;
 };
 // 시작~종료를 실제 회의 길이로 표시 (예: "08/20 (목) 09:00–10:30") — 1시간 회의면 굳이 범위로 안 보여준다.
-const fmtSlotRange = (sk, durationLabel) => {
-  if ((DURATION_MINUTES[durationLabel] || 60) <= 60) return fmtSlot(sk);
-  const end = endTimeOf(sk, durationLabel);
+const fmtSlotRange = (sk, minutes) => {
+  if ((minutes || DEFAULT_DURATION_MINUTES) <= 60) return fmtSlot(sk);
+  const end = endTimeOf(sk, minutes);
   const [d, t] = sk.split("T");
   return `${d.slice(5, 7)}/${d.slice(8, 10)} (${dayLabelOf(d)}) ${t}–${end.time}`;
 };
@@ -232,8 +239,7 @@ function buildSeedData() {
   return {
     meetingId: newMeetingId(),
     title: "",
-    duration: "1h",
-    durationLabel: "1h", // v2.4 (발견 67) — H01 드롭다운 실제 선택값
+    durationMinutes: DEFAULT_DURATION_MINUTES, // 회의 시간 — 발의 화면에서 시간/분 자유 입력
     // v2.0 (발견 77, [PRD-PERIOD-SPLIT]) — 조율 기간(응답 마감 포함)과 회의 후보 날짜를 완전히 분리한 필드
     coordinationPeriod: { start: "", end: "", endTime: "18:00" }, // 종료 시각이 곧 응답 마감
     candidatePeriod: { start: "", end: "" }, // coordinationPeriod.end 다음 날부터
@@ -333,7 +339,7 @@ function calculateBestTime(av, members, options = {}) {
   const optionals = responders.filter((m) => m.attendance === "OPTIONAL");
   const excludedCount = members.length - responders.length;
   const slots = options.slots || FULL_ALL_SLOTS; // v2.3 — 기간 확장 시 활성 범위로 좁혀 전달됨
-  const neededSlots = neededSlotsFor(options.durationLabel); // v3.0 — 회의 길이만큼 연속 슬롯 필요
+  const neededSlots = neededSlotsFor(options.durationMinutes); // v3.0 — 회의 길이만큼 연속 슬롯 필요
 
   let pool, level;
   pool = intersect(av, responders, false, slots, neededSlots); level = 0;
@@ -674,7 +680,7 @@ function RecommendList({ items, gate }) {
             <div className="flex justify-between items-center gap-3">
               <div className="flex flex-col gap-1">
                 <span className={`${T.foreground} font-semibold text-sm`}>
-                  {fmtSlotRange(slot.slotKey, meeting.durationLabel)}
+                  {fmtSlotRange(slot.slotKey, meeting.durationMinutes)}
                   {isNew && <span className={`${T.textWarning} text-xs font-bold ml-2`}>새 추천</span>}
                 </span>
                 <span className={`text-xs font-medium ${slot.tone === "ok" ? T.textSuccess : slot.tone === "warn" ? T.textWarning : T.textDestructive}`}>{slot.label}</span>
@@ -780,7 +786,7 @@ function HeatView({ collapsedLabel }) {
   const { heatOpen, setHeatOpen, meeting, heatSelected, setHeatSelected, heatmap } = useApp();
   // 확정 회의가 1시간을 넘으면 히트맵에서도 그 전체 구간을 확정 표시(테두리)해야 실제 잡힌 범위가 보인다.
   const confirmedSpan = meeting.status === "COMPLETED"
-    ? slotSpan(meeting.confirmedSlot, neededSlotsFor(meeting.durationLabel)) || [meeting.confirmedSlot]
+    ? slotSpan(meeting.confirmedSlot, neededSlotsFor(meeting.durationMinutes)) || [meeting.confirmedSlot]
     : [];
   return (
     <div className={`${T.card} ${T.border} ${T.roundedContainer} border`}>
@@ -947,9 +953,9 @@ function GridEditor({ onBack, submitLabel }) {
         ))}
       </div>
       <p className={`${T.mutedForeground} text-[11px] text-center`}>탭하면 가능 → 피하고 싶음 → 안 되는 시간 → 해제 순으로 바뀌어요 · 드래그로 한 번에 지정</p>
-      {neededSlotsFor(meeting.durationLabel) > 1 && (
+      {neededSlotsFor(meeting.durationMinutes) > 1 && (
         <p className={`${T.mutedForeground} text-[11px] text-center`}>
-          이 회의는 {DURATION_LABEL_TEXT[meeting.durationLabel]}짜리라, 빈 칸을 "가능"으로 처음 탭하면 이어지는 {neededSlotsFor(meeting.durationLabel)}칸이 한 번에 채워져요.
+          이 회의는 {fmtDuration(meeting.durationMinutes)}짜리라, 빈 칸을 "가능"으로 처음 탭하면 이어지는 {neededSlotsFor(meeting.durationMinutes)}칸이 한 번에 채워져요.
         </p>
       )}
       {/* 잠금 출처 캡션 (발견 28 — PRD 3.2) */}
@@ -1086,19 +1092,33 @@ function HostCreateScreen() {
             onChange={(e) => setMeeting((m) => ({ ...m, title: e.target.value }))}
             placeholder="회의 제목을 입력하세요" />
         )}
-        {/* [발견 67·68] 실제 선택 가능한 옵션 + 커스텀 화살표 (네이티브 select가 우측 끝에 붙는 문제 수정) */}
-        <div className="relative w-full">
-          <select
-            className={`${T.card} ${T.border} ${T.roundedElement} ${T.pCard} border w-full text-sm ${T.foreground} appearance-none pr-9`}
-            value={meeting.durationLabel || "1h"}
-            disabled={meeting.launched}
-            onChange={(e) => setMeeting((m) => ({ ...m, durationLabel: e.target.value }))}>
-            <option value="30m">30분 단위</option>
-            <option value="1h">1시간 단위</option>
-            <option value="1h30m">1시간 30분 단위</option>
-            <option value="2h">2시간 단위</option>
-          </select>
-          <span className={`${T.mutedForeground} pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs`}>▼</span>
+        {/* v3.0 — 정해진 몇 개 중 고르는 드롭다운 대신, 실제 회의 시간처럼 시간·분을 자유롭게 입력한다 */}
+        <div className={`${T.card} ${T.border} ${T.roundedElement} ${T.pCard} border flex flex-col items-center text-center gap-1`}>
+          <span className={`${T.mutedForeground} text-xs`}>회의 시간</span>
+          {meeting.launched ? (
+            <span className={`${T.foreground} text-sm font-medium`}>{fmtDuration(meeting.durationMinutes)}</span>
+          ) : (
+            <div className="flex items-center justify-center gap-1">
+              <input type="number" inputMode="numeric" min="0" max="8"
+                className={`${T.foreground} text-sm font-medium bg-transparent border-0 p-0 w-10 text-center`}
+                value={Math.floor((meeting.durationMinutes || DEFAULT_DURATION_MINUTES) / 60)}
+                onChange={(e) => {
+                  const h = Math.max(0, parseInt(e.target.value, 10) || 0);
+                  const mm = (meeting.durationMinutes || DEFAULT_DURATION_MINUTES) % 60;
+                  setMeeting((m) => ({ ...m, durationMinutes: Math.min(MAX_DURATION_MINUTES, Math.max(15, h * 60 + mm)) }));
+                }} />
+              <span className={`${T.mutedForeground} text-xs`}>시간</span>
+              <input type="number" inputMode="numeric" min="0" max="55" step="5"
+                className={`${T.foreground} text-sm font-medium bg-transparent border-0 p-0 w-10 text-center`}
+                value={(meeting.durationMinutes || DEFAULT_DURATION_MINUTES) % 60}
+                onChange={(e) => {
+                  const mm = Math.min(59, Math.max(0, parseInt(e.target.value, 10) || 0));
+                  const h = Math.floor((meeting.durationMinutes || DEFAULT_DURATION_MINUTES) / 60);
+                  setMeeting((m) => ({ ...m, durationMinutes: Math.min(MAX_DURATION_MINUTES, Math.max(15, h * 60 + mm)) }));
+                }} />
+              <span className={`${T.mutedForeground} text-xs`}>분</span>
+            </div>
+          )}
         </div>
         {/* [발견 77 재설계] 조율 기간·회의 후보 날짜 — 두 값 모두 주최자가 자유롭게 지정, 서로 겹칠 수 없음 [PRD-PERIOD-SPLIT] */}
         {/* 순서: 조율 기간(이 제품으로 회의 후보 날짜를 정해가는 실시간 구간, 종료 시각이 곧 응답 마감)을 먼저 */}
@@ -1323,7 +1343,7 @@ function AttendeeScreen() {
       <div className={`${T.background} ${T.pScreen} flex flex-col gap-4 justify-center min-h-[60vh] text-center max-w-xl mx-auto w-full`}>
         <div className={`${T.successLight} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-2`}>
           <span className={`${T.mutedForeground} text-xs`}>회의가 확정되었습니다</span>
-          <span className={`${T.foreground} text-xl font-bold`}>{fmtSlotRange(meeting.confirmedSlot, meeting.durationLabel)}</span>
+          <span className={`${T.foreground} text-xl font-bold`}>{fmtSlotRange(meeting.confirmedSlot, meeting.durationMinutes)}</span>
           <span className={`${T.textSuccess} text-sm`}>{copy.main}</span>
           {copy.absentLines.map((line) => <span key={line} className={`${T.textWarning} text-xs`}>{line}</span>)}
         </div>
@@ -1348,7 +1368,7 @@ function AttendeeScreen() {
         <div className={`${T.background} ${T.pScreen} flex flex-col gap-4 justify-center min-h-[60vh] text-center max-w-xl mx-auto w-full`}>
           <div className={`${T.card} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-2`}>
             <span className={`${T.mutedForeground} text-xs`}>대체 시간 후보</span>
-            <span className={`${T.foreground} text-lg font-bold`}>{fmtSlotRange(quickReconfirmSlot.slotKey, meeting.durationLabel)}</span>
+            <span className={`${T.foreground} text-lg font-bold`}>{fmtSlotRange(quickReconfirmSlot.slotKey, meeting.durationMinutes)}</span>
             <span className={`${T.mutedForeground} text-sm`}>{me?.name}님은 이미 이 시간에 응답한 적이 있어요. 여전히 가능하신가요?</span>
           </div>
           <button className={`${alreadyUpdated ? `${T.card} border ${T.border} ${T.mutedForeground}` : `${T.primary} ${T.primaryForeground}`} w-full py-3 ${T.roundedElement} text-sm font-bold ${T.pressed} ${alreadyUpdated ? T.disabled : ""}`}
@@ -1400,7 +1420,7 @@ function AttendeeScreen() {
           <span className={`${T.mutedForeground} text-sm`}>{hostName}님이 회의 일정 조율에 초대했습니다</span>
           <span className={`${T.foreground} text-2xl font-bold`}>{meeting.title}</span>
           <div className="flex gap-3 justify-center">
-            <span className={`${T.card} ${T.border} ${T.mutedForeground} ${T.roundedElement} border px-2 py-1 text-xs`}>소요 {DURATION_LABEL_TEXT[meeting.durationLabel] || "1시간"}</span>
+            <span className={`${T.card} ${T.border} ${T.mutedForeground} ${T.roundedElement} border px-2 py-1 text-xs`}>소요 {fmtDuration(meeting.durationMinutes)}</span>
             <span className={`${T.card} ${T.border} ${T.mutedForeground} ${T.roundedElement} border px-2 py-1 text-xs`}>응답 마감 {fmtDeadline(meeting.coordinationPeriod)}</span>
           </div>
         </div>
@@ -1473,7 +1493,7 @@ function HostDashboardScreen() {
       <div className={`${T.background} ${T.pScreen} flex flex-col gap-4 min-h-screen max-w-xl mx-auto w-full`}>
         <div className={`${T.successLight} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-3 text-center`}>
           <span className={`${T.mutedForeground} text-xs`}>회의 확정 완료</span>
-          <span className={`${T.foreground} text-3xl font-bold`}>{fmtSlotRange(meeting.confirmedSlot, meeting.durationLabel)}</span>
+          <span className={`${T.foreground} text-3xl font-bold`}>{fmtSlotRange(meeting.confirmedSlot, meeting.durationMinutes)}</span>
           <span className={`${T.textSuccess} text-sm`}>{copy.main}</span>
           {copy.absentLines.map((line) => <span key={line} className={`${T.textWarning} text-xs`}>{line}</span>)}
           <button className={`${T.primary} ${T.primaryForeground} w-full py-3 ${T.roundedElement} text-sm font-bold ${T.pressed}`}
@@ -1921,7 +1941,7 @@ export default function App() {
       track("attendance_cancelled", meeting.meetingId, { dropout_reason: "SELF_CANCEL" });
       // v2.4 개정(발견 89) — 취소=대안선택 강제: 대기 화면을 거치지 않고 곧바로 원클릭/그리드로 진입한다.
       // canQuickReconfirm(등)은 이전 렌더의 stale 클로저이므로, 방금 만든 next를 기준으로 직접 재계산한다.
-      const nextTop3 = calculateBestTime(next.availability, next.members, { excludeIds: [], slots: activeSlots(next.candidatePeriod), durationLabel: next.durationLabel });
+      const nextTop3 = calculateBestTime(next.availability, next.members, { excludeIds: [], slots: activeSlots(next.candidatePeriod), durationMinutes: next.durationMinutes });
       const topSlot = nextTop3.length && nextTop3[0].level !== 3 ? nextTop3[0] : null;
       const eligible = topSlot && ["AVAILABLE", "AVOID"].includes((next.availability[id] || {})[topSlot.slotKey]);
       selectMember(id);
@@ -2010,7 +2030,7 @@ export default function App() {
   // v2.3 신규 — 제출 직전 판정: 본인의 응답이 유일한 병목이면 조용히 재고 기회를 준다 (PRD 5.3 [PRD-PROACTIVE])
   const checkProactiveNudge = (buffer) => {
     const projected = { ...meeting.availability, [currentMemberId]: buffer };
-    const result = calculateBestTime(projected, meeting.members, { slots: activeSlots(meeting.candidatePeriod), durationLabel: meeting.durationLabel });
+    const result = calculateBestTime(projected, meeting.members, { slots: activeSlots(meeting.candidatePeriod), durationMinutes: meeting.durationMinutes });
     const top = result[0];
     const me = meeting.members.find((m) => m.id === currentMemberId);
     if (top && top.level === 2 && top.subNames.length === 1 && top.subNames[0] === me?.name) return top;
@@ -2107,7 +2127,7 @@ export default function App() {
     // 드래그로 이어 칠할 때(onSlotEnter)는 각 칸을 개별로 다루고, 이미 답이 있는 칸을 다시 탭할 때도
     // (기존 답 미세 조정 목적이므로) 블록으로 안 퍼지고 그 칸만 순환한다.
     if (next === "AVAILABLE" && prevVal === undefined) {
-      const span = slotSpan(sk, neededSlotsFor(meeting.durationLabel));
+      const span = slotSpan(sk, neededSlotsFor(meeting.durationMinutes));
       if (span && span.length > 1) { paintSpan(span, "AVAILABLE"); return; }
     }
     paintSlot(sk, next);
@@ -2149,7 +2169,7 @@ export default function App() {
   const top3 = useMemo(() => {
     if (meeting.status !== "PROGRESS" || dl.shouldBlockResult) return [];
     const excludeIds = meeting.forceClosed ? dl.pendingIds : [];
-    return calculateBestTime(meeting.availability, meeting.members, { excludeIds, slots: activeSlots(meeting.candidatePeriod), durationLabel: meeting.durationLabel });
+    return calculateBestTime(meeting.availability, meeting.members, { excludeIds, slots: activeSlots(meeting.candidatePeriod), durationMinutes: meeting.durationMinutes });
   }, [meeting, dl.shouldBlockResult]); // eslint-disable-line
   const currentTop3Ref = useRef([]);
   currentTop3Ref.current = top3;
@@ -2157,7 +2177,7 @@ export default function App() {
     if (meeting.status !== "CONFLICT") return [];
     // v2.3 개정(발견 87): 경로 A·B·C 전부 excludeIds 미사용, 본인 포함 전원 기준으로 재연산한다.
     // 각 경로의 확정 슬롯 자동 마킹(UNAVAILABLE 또는 BLOCK_STRICT)만으로 그 슬롯이 자연히 후보에서 빠진다.
-    return calculateBestTime(meeting.availability, meeting.members, { excludeIds: [], slots: activeSlots(meeting.candidatePeriod), durationLabel: meeting.durationLabel });
+    return calculateBestTime(meeting.availability, meeting.members, { excludeIds: [], slots: activeSlots(meeting.candidatePeriod), durationMinutes: meeting.durationMinutes });
   }, [meeting]);
   // [PRD-REMATCH] 6-2C 신설(발견 89) — 원클릭 재확인 대상 판정: CONFLICT 진입 후 1순위 추천 슬롯이 이미 전원(또는
   // 선택 참석자 제외 전원) 커버된 상태(level 0~2)라면, 그 슬롯에 대해 본인 기존 데이터가 이미
