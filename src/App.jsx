@@ -474,6 +474,25 @@ function resolveRoute(path, meeting) {
   return path;
 }
 
+// [DEV-HISTORY] 브라우저 뒤로/앞으로가기 지원 — 화면(currentPath) 전환마다 실제 URL에 반영해서
+// popstate로 되돌아올 수 있게 한다. 참석자 화면 내부의 단계(attendeeStage: INVITE→AUTH→GRID→DONE
+// 등)까지는 다루지 않는다 — 그건 각 화면의 "← 뒤로" 버튼이 이미 담당하고 있고, 모든 단계를 URL에
+// 실어보내는 건 별도의 훨씬 큰 작업이라 화면 단위(5개)까지만 범위로 잡았다.
+const SCREEN_TO_PATH = { landing: "/", create: "/host/create", attendee: "/attendee", dashboard: "/host/dashboard", rematch: "/host/re-match" };
+const PATH_TO_SCREEN = Object.fromEntries(Object.entries(SCREEN_TO_PATH).map(([k, v]) => [v, k]));
+function buildUrl(path, meetingId) {
+  const params = new URLSearchParams();
+  if (meetingId) params.set("m", meetingId);
+  const screen = PATH_TO_SCREEN[path] || "landing";
+  if (screen !== "landing") params.set("s", screen);
+  const qs = params.toString();
+  return qs ? `?${qs}` : "/";
+}
+function pathFromUrl() {
+  const s = new URLSearchParams(window.location.search).get("s");
+  return (s && SCREEN_TO_PATH[s]) || "/";
+}
+
 // =====================================================================
 // [DEV-CONTEXT] v2.6 신규(발견 92) — App()의 모든 상태·핸들러·파생값을 하나의 컨텍스트로 묶는다.
 // 화면 16개는 더 이상 App() 내부 클로저가 아니라 이 컨텍스트를 구독하는 실제 최상위 컴포넌트다.
@@ -1586,7 +1605,7 @@ function ReMatchScreen() {
 // =====================================================================
 export default function App() {
   const [meeting, setMeeting] = useState(loadInitialState);
-  const [currentPath, setCurrentPath] = useState("/");
+  const [currentPath, setCurrentPath] = useState(pathFromUrl);
   const [attendeeStage, setAttendeeStage] = useState("INVITE");
   const [currentMemberId, setCurrentMemberId] = useState(null);
   const [tempGrid, setTempGrid] = useState({});
@@ -1609,6 +1628,23 @@ export default function App() {
   const toastTimer = useRef(null);
   const preCancelSnapshot = useRef(null); // v2.4(발견 89) — 취소 강제 플로우 전용: 뒤로가기=취소 자체 취소
   const dragRef = useRef({ active: false, apply: null });
+  const meetingRef = useRef(meeting); // goTo/popstate 핸들러가 stale 클로저 없이 항상 최신 meeting을 읽게 함
+  useEffect(() => { meetingRef.current = meeting; }, [meeting]);
+
+  // ---- 화면 전환 + 브라우저 히스토리 동기화 ----
+  const goTo = (path, { replace = false, meetingId } = {}) => {
+    setCurrentPath(path);
+    // 발의 전엔 meetingId가 있어도 URL에 싣지 않는다 — 아직 Supabase에 없는 id라 공유해도 못 열림
+    const fallbackId = meetingRef.current.launched ? meetingRef.current.meetingId : null;
+    const url = buildUrl(path, meetingId ?? fallbackId);
+    if (replace) window.history.replaceState({ path }, "", url);
+    else window.history.pushState({ path }, "", url);
+  };
+  useEffect(() => {
+    const onPopState = () => setCurrentPath(resolveRoute(pathFromUrl(), meetingRef.current));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   // ---- 피드백 ----
   const showToast = (msg) => {
@@ -1623,7 +1659,7 @@ export default function App() {
   const navigate = (path) => {
     const r = resolveRoute(path, meeting);
     if (r === "/attendee" && currentPath !== "/attendee") setAttendeeStage("INVITE");
-    setCurrentPath(r);
+    goTo(r);
     setConfirmOpen(null);
     setCancelStage(null);
     setConflictEdit(null);
@@ -1631,7 +1667,7 @@ export default function App() {
   };
   useEffect(() => {
     const r = resolveRoute(currentPath, meeting);
-    if (r !== currentPath) setCurrentPath(r);
+    if (r !== currentPath) goTo(r, { replace: true }); // 자동 보정(가드) — 새 히스토리를 쌓지 않고 대체
   }, [meeting.status, meeting.launched]); // eslint-disable-line
   // 상태 전이 시 탐색 상태 리셋 — COMPLETED 위계 준수 (발견 36 부수)
   useEffect(() => {
@@ -1675,7 +1711,7 @@ export default function App() {
       // resolveRoute를 방금 받아온 실제 상태(data.data) 기준으로 직접 호출한다 — meeting 상태 변경과 경로 변경이
       // 같은 배치로 묶이면, currentPath만 바꾸는 별도 이펙트가 아직 로컬(구) meeting을 참조해 CONFLICT/COMPLETED/
       // CANCELLED로 이미 전이된 회의를 일반 대시보드/초대 화면에 잘못 멈춰두는 문제가 있었다.
-      setCurrentPath(resolveRoute(mine ? "/host/dashboard" : "/attendee", data.data));
+      goTo(resolveRoute(mine ? "/host/dashboard" : "/attendee", data.data), { replace: true, meetingId: mId });
       if (!mine) {
         sessionStorage.setItem("meetsync_link_opened_at", String(Date.now())); // availability_submitted의 response_delay_hours 계산용
         track("invite_link_opened", mId, {});
@@ -1847,7 +1883,8 @@ export default function App() {
   // ---- 초기화 ----
   const resetMeeting = (toPath) => {
     localStorage.removeItem(STORAGE_KEY);
-    setMeeting(buildSeedData());
+    const fresh = buildSeedData();
+    setMeeting(fresh);
     setTempGrid({});
     setAlertBanner(null);
     setCurrentMemberId(null);
@@ -1855,7 +1892,7 @@ export default function App() {
     setHeatSelected(null); setHeatOpen(false);
     setConfirmOpen(null); setCancelStage(null); setConflictEdit(null);
     setNewCardKeys([]);
-    setCurrentPath(toPath);
+    goTo(toPath, { meetingId: fresh.launched ? fresh.meetingId : null }); // 새로 만든 회의는 아직 미발의 상태라 URL에 실을 게 없다
     showToast("초기화되었습니다");
   };
 
@@ -1890,10 +1927,8 @@ export default function App() {
     const launchedAt = new Date().toISOString();
     setMeeting(commitMeeting({ ...meeting, launched: true, launchedAt }));
     markAsHosted(meeting.meetingId); // 이 브라우저가 발의한 회의로 기록 — 참석자와 주최자 구분의 근거
-    // 새로고침해도 같은 회의로 돌아오도록, 그리고 링크가 실제로 이 회의를 가리키도록 주소에 반영한다.
-    window.history.replaceState(null, "", `?m=${meeting.meetingId}`);
     showToast("초대 링크가 생성되었습니다");
-    setCurrentPath("/host/dashboard");
+    goTo("/host/dashboard", { meetingId: meeting.meetingId }); // 링크가 실제로 이 회의를 가리키도록 주소에도 반영
     track("meeting_created", meeting.meetingId, {
       member_count: meeting.members.length,
       candidate_days: activeDates(meeting.candidatePeriod).length,
