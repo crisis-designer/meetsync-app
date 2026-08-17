@@ -109,6 +109,23 @@ const CONFIRMED_BG = `${T.primary} ${T.primaryForeground}`; // v1.9 — 실제 �
 
 // [DEV-DATA-GRID] 슬롯 체계 — PRD 3.1
 const STORAGE_KEY = "meetsync-state";
+// "이 브라우저가 이 회의를 실제로 발의(launch)했는가" 전용 기록 — STORAGE_KEY 캐시(마지막으로 본 회의 하나)와는
+// 별개다. 참석자도 응답을 제출하면 STORAGE_KEY 캐시가 그 회의로 채워지므로, 캐시 존재만으로 "주최자"를
+// 판별하면 응답 제출 후 같은 링크에 재접속한 참석자를 주최자로 오판하는 버그가 생긴다.
+const HOSTED_IDS_KEY = "meetsync-hosted-ids";
+function markAsHosted(meetingId) {
+  try {
+    const ids = JSON.parse(localStorage.getItem(HOSTED_IDS_KEY) || "[]");
+    if (!ids.includes(meetingId)) localStorage.setItem(HOSTED_IDS_KEY, JSON.stringify([...ids, meetingId]));
+  } catch (e) { /* 저장 실패해도 화면은 계속 진행 */ }
+}
+function isHostedByMe(meetingId) {
+  try {
+    return JSON.parse(localStorage.getItem(HOSTED_IDS_KEY) || "[]").includes(meetingId);
+  } catch (e) {
+    return false;
+  }
+}
 // 실사용 전환 — 데모 시절엔 2026-07-13~22로 날짜가 고정돼 있었다. 오늘부터 90일치를 동적으로 생성해
 // 조율 기간·회의 후보 날짜 선택이 항상 "지금"을 기준으로 동작하게 한다.
 const DAY_NAMES = ["일", "월", "화", "수", "목", "금", "토"];
@@ -124,8 +141,14 @@ function buildFullDates(days = 90) {
   return out;
 }
 const FULL_DATES = buildFullDates();
-const DAY_LABEL = Object.fromEntries(FULL_DATES.map((d) => [d, DAY_NAMES[new Date(`${d}T00:00:00`).getDay()]]));
+// 날짜별 요일 — FULL_DATES 미리 계산 테이블 대신 그때그때 직접 계산한다. 테이블 방식은 회의가 만들어진 뒤
+// 실제 "오늘"이 지나가면서 FULL_DATES의 롤링 윈도우 밖으로 밀려난 과거 날짜의 요일이 빈 문자열로 새는 문제가 있었다.
+const dayLabelOf = (d) => DAY_NAMES[new Date(`${d}T00:00:00`).getDay()];
 const HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17];
+// 발의 화면 드롭다운(30분/1시간/1시간 30분/2시간 "단위")의 실제 표시용 매핑.
+// 주의: 이 선택은 표시 문구에만 반영되고, 그리드 자체는 항상 09~17시 1시간 슬롯 고정이다 — 실제로
+// 30분/2시간 단위로 슬롯을 나누려면 HOURS·slotKeyOf 기반 슬롯 체계를 다시 짜야 하는 별도 작업이다.
+const DURATION_LABEL_TEXT = { "30m": "30분", "1h": "1시간", "1h30m": "1시간 30분", "2h": "2시간" };
 const slotKeyOf = (date, h) => `${date}T${String(h).padStart(2, "0")}:00`;
 const FULL_ALL_SLOTS = FULL_DATES.flatMap((d) => HOURS.map((h) => slotKeyOf(d, h)));
 // v2.4 개정(발견 88): DATES/ALL_SLOTS(고정 3일 하드코딩) 제거 — buildMemberResponse가 이제
@@ -136,14 +159,14 @@ const activeDates = (period) => FULL_DATES.filter((d) => d >= period.start && d 
 const activeSlots = (period) => activeDates(period).flatMap((d) => HOURS.map((h) => slotKeyOf(d, h)));
 const fmtSlot = (sk) => {
   const [d, t] = sk.split("T");
-  return `${d.slice(5, 7)}/${d.slice(8, 10)} (${DAY_LABEL[d]}) ${t}`;
+  return `${d.slice(5, 7)}/${d.slice(8, 10)} (${dayLabelOf(d)}) ${t}`;
 };
 const fmtDeadline = (cp) => { // v2.0 — coordinationPeriod 객체를 받아 "종료일(요일) 종료시각" 문자열 생성
   const d = cp.end;
-  return `${d.slice(5, 7)}.${d.slice(8, 10)} (${DAY_LABEL[d] || ""}) ${cp.endTime}`;
+  return `${d.slice(5, 7)}.${d.slice(8, 10)} (${dayLabelOf(d)}) ${cp.endTime}`;
 };
 const fmtPeriod = (p) =>
-  `${p.start.slice(5, 7)}.${p.start.slice(8, 10)} (${DAY_LABEL[p.start]}) ~ ${p.end.slice(5, 7)}.${p.end.slice(8, 10)} (${DAY_LABEL[p.end]})`;
+  `${p.start.slice(5, 7)}.${p.start.slice(8, 10)} (${dayLabelOf(p.start)}) ~ ${p.end.slice(5, 7)}.${p.end.slice(8, 10)} (${dayLabelOf(p.end)})`;
 
 // 새 참석자 id 생성 — 데모 시절엔 m1~m6 고정 id였지만, 이제 호스트가 실제로 몇 명이든 추가할 수 있다.
 function newMemberId() {
@@ -196,15 +219,19 @@ function buildSeedData() {
 // v2.6(발견 92) — 읽기 경로(loadInitialState)는 try/catch가 있었는데 쓰기 경로는 없어 저장공간
 // 초과·사파리 프라이빗 모드에서 예외가 그대로 튈 수 있었다. 커밋 실패해도 화면 자체는 최신 상태를
 // 유지해야 하므로(다음 새로고침 시 되돌아가는 정도는 감수), 조용히 무시하고 다음 값을 그대로 반환한다.
+// commitMeeting은 로컬 화면은 항상 낙관적으로 즉시 진행시키지만(끊김 없는 조작감), 발의된 회의는
+// Supabase에도 실제로 올라가야 다른 사람이 볼 수 있다. 이 원격 저장이 조용히 실패하면(오프라인 등)
+// 참석자는 "제출됐다"는 토스트를 보고도 실제로는 아무도 그 응답을 못 보는 상황이 생긴다 — 그래서
+// 실패를 onSyncFailure로 앱 전역에 알려 화면 상단에 "다시 시도" 배너를 띄운다.
+let onSyncResult = null; // App() 마운트 시 연결됨 — (failed: boolean) => void
 function commitMeeting(next) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch (e) { /* 저장 실패해도 화면 상태 자체는 계속 진행 — 다음 커밋에서 재시도됨 */ }
-  // 발의된 회의만 Supabase에 올린다 — 발의 전엔 아직 다른 사람과 공유할 대상 자체가 없다.
-  // fire-and-forget: 실패해도(오프라인 등) 로컬 상태·localStorage는 이미 최신이라 화면은 계속 진행된다.
   if (next.launched) {
     supabase.from("meetings").upsert({ id: next.meetingId, data: next, updated_at: new Date().toISOString() }).then(({ error }) => {
       if (error) console.error("Supabase 저장 실패:", error.message);
+      onSyncResult?.(Boolean(error));
     });
   }
   return next;
@@ -458,10 +485,12 @@ function useApp() { return useContext(AppContext); }
 // 공통 컴포넌트 (v2.6부터 실제 컴포넌트 — App() 클로저에서 분리, useApp()으로 구독)
 // =====================================================================
 function BrandBar() {
-  const { isProductScreen, currentPath, currentMemberId, attendeeStage, conflictEdit, nameOf } = useApp();
+  const { isProductScreen, currentPath, currentMemberId, attendeeStage, conflictEdit, nameOf, navigate } = useApp();
   return (
     <div className={`${T.card} ${T.border} px-6 py-3 border-b flex justify-between items-center select-none`}>
-      <span className={`${T.foreground} font-bold text-sm cursor-default`}>MeetSync</span>
+      {/* 로고 = 홈으로 — 화면마다 처음(랜딩)으로 돌아갈 방법이 없던 것 보강. 진행 중인 회의 자체는 그대로 남아있고
+          단지 화면만 랜딩으로 이동한다(초대 링크로 다시 들어가면 이어서 볼 수 있음). */}
+      <button className={`${T.foreground} font-bold text-sm ${T.pressed}`} onClick={() => navigate("/")}>MeetSync</button>
       {isProductScreen && (
         <span className={`${currentPath === "/attendee" ? T.success : T.primary} ${T.primaryForeground} ${T.roundedElement} px-2 py-1 text-xs font-medium max-w-[160px] truncate`}>
           {currentPath === "/attendee"
@@ -499,6 +528,18 @@ function AlertBannerView() {
       {/* v2.8 (반응형 수정, 발견 52 재적용): 텍스트 크기만큼만 잡히던 히트박스를 44×44 최소
           터치 타겟으로 확대. -m-2로 시각적 레이아웃은 그대로 유지하고 탭 영역만 넓힌다. */}
       <button className={`${T.textDestructive} ${T.pressed} font-bold min-w-11 min-h-11 flex items-center justify-center -m-2 shrink-0`} onClick={() => setAlertBanner(null)}>✕</button>
+    </div>
+  ) : null;
+}
+
+// 화면(참석자·주최자 무관)과 무관하게 항상 보이는 배너 — 저장이 실제로 서버까지 못 갔을 때
+// "제출됐다"는 토스트만 보고 아무도 그 응답을 못 보는 상황을 막는다.
+function SyncFailedBanner() {
+  const { syncFailed, retrySync } = useApp();
+  return syncFailed ? (
+    <div className={`${T.destructiveLight} ${T.borderDestructive} ${T.textDestructive} ${T.pCard} ${T.roundedElement} border text-sm flex justify-between items-center gap-2 mx-6 mt-4`}>
+      <span>저장이 서버까지 전달되지 않았어요 — 인터넷 연결을 확인해주세요.</span>
+      <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs font-bold ${T.pressed} shrink-0`} onClick={retrySync}>다시 시도</button>
     </div>
   ) : null;
 }
@@ -667,7 +708,7 @@ function HeatView({ collapsedLabel }) {
           <div className="grid gap-1" style={{ gridTemplateColumns: `auto repeat(${activeDates(meeting.candidatePeriod).length}, 1fr)` }}>
             <div />
             {activeDates(meeting.candidatePeriod).map((d) => (
-              <div key={d} className={`${T.mutedForeground} text-xs text-center pb-1`}>{d.slice(5, 7)}/{d.slice(8, 10)} ({DAY_LABEL[d]})</div>
+              <div key={d} className={`${T.mutedForeground} text-xs text-center pb-1`}>{d.slice(5, 7)}/{d.slice(8, 10)} ({dayLabelOf(d)})</div>
             ))}
             {HOURS.map((h) => (
               <React.Fragment key={h}>
@@ -789,7 +830,7 @@ function GridEditor({ onBack, submitLabel }) {
             // [DS-FLOW-A01-DAYBULK] 날짜 헤더 탭 → 일 단위 일괄 불가 (v2.3, PRD 3.3)
             // v2.5(발견 79): periodExtendedFrom보다 뒤 날짜는 "새로 추가됨" 강조 — 기간 확장 시 전원 통지의 시각적 실체
             <button key={d} className={`${T.mutedForeground} text-xs text-center pb-1 ${T.pressed}`} onClick={() => fillDayUnavailable(d)}>
-              {d.slice(5, 7)}/{d.slice(8, 10)} ({DAY_LABEL[d]})
+              {d.slice(5, 7)}/{d.slice(8, 10)} ({dayLabelOf(d)})
               {isNewlyAddedDate(d, meeting.periodExtendedFrom) && (
                 <span className={`block ${T.textWarning} text-[10px] font-bold`}>새로 추가됨</span>
               )}
@@ -1269,7 +1310,7 @@ function AttendeeScreen() {
           <span className={`${T.mutedForeground} text-sm`}>{hostName}님이 회의 일정 조율에 초대했습니다</span>
           <span className={`${T.foreground} text-2xl font-bold`}>{meeting.title}</span>
           <div className="flex gap-3 justify-center">
-            <span className={`${T.card} ${T.border} ${T.mutedForeground} ${T.roundedElement} border px-2 py-1 text-xs`}>소요 1시간</span>
+            <span className={`${T.card} ${T.border} ${T.mutedForeground} ${T.roundedElement} border px-2 py-1 text-xs`}>소요 {DURATION_LABEL_TEXT[meeting.durationLabel] || "1시간"}</span>
             <span className={`${T.card} ${T.border} ${T.mutedForeground} ${T.roundedElement} border px-2 py-1 text-xs`}>응답 마감 {fmtDeadline(meeting.coordinationPeriod)}</span>
           </div>
         </div>
@@ -1281,6 +1322,7 @@ function AttendeeScreen() {
   }
   if (attendeeStage === "AUTH") {
     return <MemberPicker title="참석자 확인" sub="본인의 이름을 선택해주세요."
+      onBack={() => setAttendeeStage("INVITE")}
       onPick={(id) => { selectMember(id); setAttendeeStage("GRID"); }} />;
   }
   if (attendeeStage === "DONE") {
@@ -1551,6 +1593,7 @@ export default function App() {
   const [alertBanner, setAlertBanner] = useState(null);
   const [toast, setToast] = useState(null);
   const [syncChecking, setSyncChecking] = useState(false);
+  const [syncFailed, setSyncFailed] = useState(false); // 저장이 실제로 서버까지 도달했는지 — 실패 시 상단 배너로 알림
   const [heatOpen, setHeatOpen] = useState(false);
   const [heatSelected, setHeatSelected] = useState(null);
   const [confirmOpen, setConfirmOpen] = useState(null); // [DEV 2.9] CF01 — {type, slotKey?, memberId?} 동시 1개, 자동 소멸 없음
@@ -1602,6 +1645,13 @@ export default function App() {
     if (meeting.status !== "CONFLICT") setConflictEdit(null);
   }, [meeting.status]);
 
+  // ---- 원격 저장 실패 감지 — commitMeeting()의 Supabase 쓰기가 실패/성공할 때마다 호출됨 ----
+  useEffect(() => {
+    onSyncResult = (failed) => setSyncFailed(failed);
+    return () => { onSyncResult = null; };
+  }, []);
+  const retrySync = () => commitMeeting(meeting); // 지금 화면에 보이는 상태 그대로 다시 저장 시도
+
   // ---- [DEV-SYNC] 멀티탭 동기화 (같은 브라우저, localStorage 기반) ----
   useEffect(() => {
     const onStorage = (e) => {
@@ -1618,11 +1668,14 @@ export default function App() {
   useEffect(() => {
     const mId = new URLSearchParams(window.location.search).get("m");
     if (!mId) return;
-    const mine = mId === meeting.meetingId && meeting.launched;
+    const mine = isHostedByMe(mId); // STORAGE_KEY 캐시가 아니라 발의 이력으로 판별 — 응답 제출한 참석자와 구분
     supabase.from("meetings").select("data").eq("id", mId).single().then(({ data, error }) => {
       if (error || !data) return; // 잘못된 링크거나 아직 동기화 전 — 로컬 상태 그대로 둔다
       setMeeting(data.data);
-      setCurrentPath(mine ? "/host/dashboard" : "/attendee");
+      // resolveRoute를 방금 받아온 실제 상태(data.data) 기준으로 직접 호출한다 — meeting 상태 변경과 경로 변경이
+      // 같은 배치로 묶이면, currentPath만 바꾸는 별도 이펙트가 아직 로컬(구) meeting을 참조해 CONFLICT/COMPLETED/
+      // CANCELLED로 이미 전이된 회의를 일반 대시보드/초대 화면에 잘못 멈춰두는 문제가 있었다.
+      setCurrentPath(resolveRoute(mine ? "/host/dashboard" : "/attendee", data.data));
       if (!mine) {
         sessionStorage.setItem("meetsync_link_opened_at", String(Date.now())); // availability_submitted의 response_delay_hours 계산용
         track("invite_link_opened", mId, {});
@@ -1836,6 +1889,7 @@ export default function App() {
   const launchMeeting = () => {
     const launchedAt = new Date().toISOString();
     setMeeting(commitMeeting({ ...meeting, launched: true, launchedAt }));
+    markAsHosted(meeting.meetingId); // 이 브라우저가 발의한 회의로 기록 — 참석자와 주최자 구분의 근거
     // 새로고침해도 같은 회의로 돌아오도록, 그리고 링크가 실제로 이 회의를 가리키도록 주소에 반영한다.
     window.history.replaceState(null, "", `?m=${meeting.meetingId}`);
     showToast("초대 링크가 생성되었습니다");
@@ -2033,6 +2087,7 @@ export default function App() {
     meeting, setMeeting,
     currentPath, setCurrentPath, attendeeStage, setAttendeeStage, currentMemberId, setCurrentMemberId,
     tempGrid, setTempGrid, alertBanner, setAlertBanner, toast, setToast, syncChecking, setSyncChecking,
+    syncFailed, retrySync,
     heatOpen, setHeatOpen, heatSelected, setHeatSelected, confirmOpen, setConfirmOpen,
     cancelStage, setCancelStage, lateJoinId, setLateJoinId, proactiveOffer, setProactiveOffer,
     cancelReasonDraft, setCancelReasonDraft, demoteNoteDraft, setDemoteNoteDraft,
@@ -2055,6 +2110,7 @@ export default function App() {
     <AppContext.Provider value={ctx}>
       <div className={`${T.background} min-h-screen`}>
         <BrandBar />
+        <SyncFailedBanner />
         {isProductScreen && <StepIndicator />}
         {isHostScreen && <AlertBannerView />}
         {currentPath === "/" && <LandingScreen />}
