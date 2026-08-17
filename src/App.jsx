@@ -145,12 +145,55 @@ const FULL_DATES = buildFullDates();
 // 실제 "오늘"이 지나가면서 FULL_DATES의 롤링 윈도우 밖으로 밀려난 과거 날짜의 요일이 빈 문자열로 새는 문제가 있었다.
 const dayLabelOf = (d) => DAY_NAMES[new Date(`${d}T00:00:00`).getDay()];
 const HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17];
-// 발의 화면 드롭다운(30분/1시간/1시간 30분/2시간 "단위")의 실제 표시용 매핑.
-// 주의: 이 선택은 표시 문구에만 반영되고, 그리드 자체는 항상 09~17시 1시간 슬롯 고정이다 — 실제로
-// 30분/2시간 단위로 슬롯을 나누려면 HOURS·slotKeyOf 기반 슬롯 체계를 다시 짜야 하는 별도 작업이다.
+// 발의 화면 드롭다운(30분/1시간/1시간 30분/2시간 "단위")의 표시용 매핑 + 실제 분 단위.
+// 그리드 자체는 항상 09~17시 1시간 슬롯 고정이지만(전 회의 공통 — 알고리즘 단순성·유연성 유지),
+// 회의 시간이 1시간을 넘으면 "몇 개의 연속 슬롯이 전원 비어야 하는지"(neededSlotsFor)를 계산해
+// 추천 알고리즘이 실제로 그 길이만큼 연속 가능 여부를 확인하고, 확정 시각도 정확한 종료 시각으로 표시한다.
 const DURATION_LABEL_TEXT = { "30m": "30분", "1h": "1시간", "1h30m": "1시간 30분", "2h": "2시간" };
+const DURATION_MINUTES = { "30m": 30, "1h": 60, "1h30m": 90, "2h": 120 };
+const neededSlotsFor = (durationLabel) => Math.ceil((DURATION_MINUTES[durationLabel] || 60) / 60);
 const slotKeyOf = (date, h) => `${date}T${String(h).padStart(2, "0")}:00`;
 const FULL_ALL_SLOTS = FULL_DATES.flatMap((d) => HOURS.map((h) => slotKeyOf(d, h)));
+// 시작 슬롯(startSk)부터 neededSlots개 연속 슬롯 — 그 날짜의 HOURS 범위를 넘어가면(다음날로 스필오버)
+// null을 반환해 애초에 후보에서 제외한다(회의가 자정을 넘겨 다음날로 이어지는 건 지원 범위 밖).
+function slotSpan(startSk, neededSlots) {
+  const [date, t] = startSk.split("T");
+  const h = parseInt(t.slice(0, 2), 10);
+  const idx = HOURS.indexOf(h);
+  if (idx === -1 || idx + neededSlots > HOURS.length) return null;
+  return HOURS.slice(idx, idx + neededSlots).map((hh) => slotKeyOf(date, hh));
+}
+// span 전체를 놓고 봤을 때 이 사람의 상태 — 한 시간이라도 막히면 전체가 막힌 것, 하나라도 비선호면 비선호.
+function spanStatus(av, memberId, span) {
+  let sawAvoid = false;
+  for (const sk of span) {
+    const v = (av[memberId] || {})[sk];
+    if (v !== "AVAILABLE" && v !== "AVOID") return "BLOCKED";
+    if (v === "AVOID") sawAvoid = true;
+  }
+  return sawAvoid ? "AVOID" : "AVAILABLE";
+}
+// spanStatus가 "BLOCKED"일 때만 호출 — 표시용 사유를 span 안에서 가장 심각한 것 하나로 요약
+function spanBlockReason(av, memberId, span) {
+  const rank = { UNSET: 1, BLOCK: 2, UNAVAILABLE: 3 };
+  let worst = null;
+  span.forEach((sk) => {
+    const v = (av[memberId] || {})[sk];
+    if (v === "AVAILABLE" || v === "AVOID") return;
+    const r = v === "UNAVAILABLE" ? "UNAVAILABLE" : v === "BLOCK_STRICT" ? "BLOCK" : "UNSET";
+    if (!worst || rank[r] > rank[worst]) worst = r;
+  });
+  return worst || "UNSET";
+}
+// 확정 슬롯의 실제 종료 시각 — neededSlots(정수 시간 칸)와 달리 분 단위 실제 길이를 그대로 반영한다
+// (예: 1시간 30분 회의는 칸은 2개 쓰지만 종료는 시작+90분이지 +2시간이 아니다).
+function endTimeOf(startSk, durationLabel) {
+  const [date, t] = startSk.split("T");
+  const startMin = parseInt(t.slice(0, 2), 10) * 60 + parseInt(t.slice(3, 5), 10);
+  const endMin = startMin + (DURATION_MINUTES[durationLabel] || 60);
+  const eh = Math.floor(endMin / 60) % 24, em = endMin % 60;
+  return { date, time: `${String(eh).padStart(2, "0")}:${String(em).padStart(2, "0")}` };
+}
 // v2.4 개정(발견 88): DATES/ALL_SLOTS(고정 3일 하드코딩) 제거 — buildMemberResponse가 이제
 // candidatePeriod 인자를 받아 activeSlots()로 직접 채우므로 고정 폭 상수 자체가 불필요해졌다.
 // (v2.7/발견 86에서 "5일 전체 미리 채우기"의 결함을 "3일 고정 채우기"로 부분 수정했었으나,
@@ -160,6 +203,13 @@ const activeSlots = (period) => activeDates(period).flatMap((d) => HOURS.map((h)
 const fmtSlot = (sk) => {
   const [d, t] = sk.split("T");
   return `${d.slice(5, 7)}/${d.slice(8, 10)} (${dayLabelOf(d)}) ${t}`;
+};
+// 시작~종료를 실제 회의 길이로 표시 (예: "08/20 (목) 09:00–10:30") — 1시간 회의면 굳이 범위로 안 보여준다.
+const fmtSlotRange = (sk, durationLabel) => {
+  if ((DURATION_MINUTES[durationLabel] || 60) <= 60) return fmtSlot(sk);
+  const end = endTimeOf(sk, durationLabel);
+  const [d, t] = sk.split("T");
+  return `${d.slice(5, 7)}/${d.slice(8, 10)} (${dayLabelOf(d)}) ${t}–${end.time}`;
 };
 const fmtDeadline = (cp) => { // v2.0 — coordinationPeriod 객체를 받아 "종료일(요일) 종료시각" 문자열 생성
   const d = cp.end;
@@ -246,26 +296,33 @@ function loadInitialState() {
 }
 
 // [DEV-EX-01] 추천 연산 — 완화 0~3 + 사유 구분 (UNAVAILABLE·UNSET·BLOCK 격상 불가)
-function intersect(av, group, allowAvoid, slots) {
+// v3.0 — 회의 시간이 1시간을 넘으면(neededSlots>1) 시작 슬롯 하나만 보지 않고, 그 뒤로 이어지는
+// 연속 슬롯 전체(span)가 전원 비어있는지 확인한다. 날짜 경계를 넘어가는 시작점(slotSpan이 null)은
+// 애초에 후보에서 제외된다.
+function intersect(av, group, allowAvoid, starts, neededSlots) {
   if (!group.length) return [];
-  return slots.filter((sk) =>
-    group.every((m) => {
-      const v = (av[m.id] || {})[sk];
-      return v === "AVAILABLE" || (allowAvoid && v === "AVOID");
-    })
-  );
+  return starts.filter((sk) => {
+    const span = slotSpan(sk, neededSlots);
+    if (!span) return false;
+    return group.every((m) => {
+      const st = spanStatus(av, m.id, span);
+      return st === "AVAILABLE" || (allowAvoid && st === "AVOID");
+    });
+  });
 }
-function partialFit(av, required, slots) {
-  const scored = slots.map((sk) => {
+function partialFit(av, required, starts, neededSlots) {
+  const scored = starts.map((sk) => {
+    const span = slotSpan(sk, neededSlots);
+    if (!span) return null;
     const absentees = [];
     let fit = 0;
     required.forEach((m) => {
-      const v = (av[m.id] || {})[sk];
-      if (v === "AVAILABLE" || v === "AVOID") fit += 1;
-      else absentees.push({ id: m.id, name: m.name, reason: v === "UNAVAILABLE" ? "UNAVAILABLE" : v === "BLOCK_STRICT" ? "BLOCK" : "UNSET" });
+      const st = spanStatus(av, m.id, span);
+      if (st === "AVAILABLE" || st === "AVOID") fit += 1;
+      else absentees.push({ id: m.id, name: m.name, reason: spanBlockReason(av, m.id, span) });
     });
     return { slotKey: sk, fit, absentees };
-  });
+  }).filter(Boolean);
   const max = Math.max(...scored.map((s) => s.fit));
   return scored.filter((s) => s.fit === max);
 }
@@ -276,22 +333,26 @@ function calculateBestTime(av, members, options = {}) {
   const optionals = responders.filter((m) => m.attendance === "OPTIONAL");
   const excludedCount = members.length - responders.length;
   const slots = options.slots || FULL_ALL_SLOTS; // v2.3 — 기간 확장 시 활성 범위로 좁혀 전달됨
+  const neededSlots = neededSlotsFor(options.durationLabel); // v3.0 — 회의 길이만큼 연속 슬롯 필요
 
   let pool, level;
-  pool = intersect(av, responders, false, slots); level = 0;
-  if (!pool.length) { pool = intersect(av, required, false, slots); level = 1; }
-  if (!pool.length) { pool = intersect(av, required, true, slots); level = 2; }
+  pool = intersect(av, responders, false, slots, neededSlots); level = 0;
+  if (!pool.length) { pool = intersect(av, required, false, slots, neededSlots); level = 1; }
+  if (!pool.length) { pool = intersect(av, required, true, slots, neededSlots); level = 2; }
   let items;
-  if (!pool.length) { items = partialFit(av, required, slots); level = 3; }
+  if (!pool.length) { items = partialFit(av, required, slots, neededSlots); level = 3; }
   else items = pool.map((sk) => ({ slotKey: sk, fit: 0, absentees: [] }));
 
   // 정렬 우선순위 (v1.9 — PRD 3.4 역전, 발견 49): ①필수 참석자 비선호 최소 ②선택 참석자 참여 최대 ③빠른 시간
   // v1.8까지 "선택 참석자 참여"를 1순위로 뒀던 것은 필수 참석자 불편 최소화(관계 비용 테제)를 밀어내는 결과라 역전한다.
-  const meta = (sk) => ({
-    avoidRequired: required.filter((m) => (av[m.id] || {})[sk] === "AVOID").length,
-    optAvail: optionals.filter((m) => (av[m.id] || {})[sk] === "AVAILABLE").length,
-    t: FULL_ALL_SLOTS.indexOf(sk), // 정렬 기준은 항상 전체 범위 인덱스(시간순 일관성 유지)
-  });
+  const meta = (sk) => {
+    const span = slotSpan(sk, neededSlots) || [sk];
+    return {
+      avoidRequired: required.filter((m) => spanStatus(av, m.id, span) === "AVOID").length,
+      optAvail: optionals.filter((m) => spanStatus(av, m.id, span) === "AVAILABLE").length,
+      t: FULL_ALL_SLOTS.indexOf(sk), // 정렬 기준은 항상 전체 범위 인덱스(시간순 일관성 유지)
+    };
+  };
   items.sort((a, b) => {
     const A = meta(a.slotKey), B = meta(b.slotKey);
     if (level === 3 && b.fit !== a.fit) return b.fit - a.fit;
@@ -301,6 +362,7 @@ function calculateBestTime(av, members, options = {}) {
   });
 
   return items.slice(0, 3).map((it) => {
+    const span = slotSpan(it.slotKey, neededSlots) || [it.slotKey];
     let label, tone, subline = "", subNames = [], reRequestTargets = [], blockNames = [];
     if (level === 0) {
       label = excludedCount > 0 ? "제출한 사람은 모두 가능해요" : "모두 가능한 시간이에요"; tone = "ok";
@@ -309,7 +371,7 @@ function calculateBestTime(av, members, options = {}) {
       label = `선택 참석자 ${subNames.length}명 빼고 가능해요`; tone = "warn";
       subline = `빠진 선택 참석자: ${subNames.join(", ")}`;
     } else if (level === 2) {
-      subNames = required.filter((m) => (av[m.id] || {})[it.slotKey] === "AVOID").map((m) => m.name);
+      subNames = required.filter((m) => spanStatus(av, m.id, span) === "AVOID").map((m) => m.name);
       label = "일부는 피하고 싶은 시간이에요"; tone = "warn";
       subline = `피하고 싶은 시간대: ${subNames.join(", ")}`;
     } else {
@@ -612,7 +674,7 @@ function RecommendList({ items, gate }) {
             <div className="flex justify-between items-center gap-3">
               <div className="flex flex-col gap-1">
                 <span className={`${T.foreground} font-semibold text-sm`}>
-                  {fmtSlot(slot.slotKey)}
+                  {fmtSlotRange(slot.slotKey, meeting.durationLabel)}
                   {isNew && <span className={`${T.textWarning} text-xs font-bold ml-2`}>새 추천</span>}
                 </span>
                 <span className={`text-xs font-medium ${slot.tone === "ok" ? T.textSuccess : slot.tone === "warn" ? T.textWarning : T.textDestructive}`}>{slot.label}</span>
@@ -716,6 +778,10 @@ function RecommendList({ items, gate }) {
 // 히트맵 (D01 공용) — 램프 + 마커 분리
 function HeatView({ collapsedLabel }) {
   const { heatOpen, setHeatOpen, meeting, heatSelected, setHeatSelected, heatmap } = useApp();
+  // 확정 회의가 1시간을 넘으면 히트맵에서도 그 전체 구간을 확정 표시(테두리)해야 실제 잡힌 범위가 보인다.
+  const confirmedSpan = meeting.status === "COMPLETED"
+    ? slotSpan(meeting.confirmedSlot, neededSlotsFor(meeting.durationLabel)) || [meeting.confirmedSlot]
+    : [];
   return (
     <div className={`${T.card} ${T.border} ${T.roundedContainer} border`}>
       <button className={`${T.pCard} ${T.pressed} flex justify-between w-full items-center`} onClick={() => setHeatOpen((v) => !v)}>
@@ -734,7 +800,7 @@ function HeatView({ collapsedLabel }) {
                 <div className={`${T.mutedForeground} text-xs pr-2 flex items-center`}>{String(h).padStart(2, "0")}:00</div>
                 {activeDates(meeting.candidatePeriod).map((d) => {
                   const sk = slotKeyOf(d, h);
-                  const confirmed = meeting.confirmedSlot === sk && meeting.status === "COMPLETED";
+                  const confirmed = confirmedSpan.includes(sk);
                   const ring = confirmed ? RING_CONFIRMED : heatSelected === sk ? RING_SELECTED : "";
                   const bg = confirmed ? CONFIRMED_BG : heatToken(heatmap[sk].count); // v1.8 — 확정은 램프와 다른 계열 (발견 41)
                   return (
@@ -749,7 +815,7 @@ function HeatView({ collapsedLabel }) {
             <div className={`border-t ${T.border} mt-3 pt-3 flex flex-col gap-1`}>
               <span className={`${T.foreground} text-sm font-medium`}>
                 {fmtSlot(heatSelected)} <span className={`${T.mutedForeground} text-xs`}>가능 {heatmap[heatSelected].count}명</span>
-                {meeting.status === "COMPLETED" && meeting.confirmedSlot === heatSelected && <span className={`${T.textSuccess} text-xs font-bold ml-2`}>확정된 시간</span>}
+                {confirmedSpan.includes(heatSelected) && <span className={`${T.textSuccess} text-xs font-bold ml-2`}>확정된 시간</span>}
               </span>
               {heatmap[heatSelected].detail.map((d) => (
                 <span key={d.name} className={`text-xs ${d.state === "AVAILABLE" ? T.textSuccess : d.state === "AVOID" ? T.textWarning : d.state === "UNAVAILABLE" ? T.textDestructive : T.mutedForeground}`}>
@@ -881,6 +947,11 @@ function GridEditor({ onBack, submitLabel }) {
         ))}
       </div>
       <p className={`${T.mutedForeground} text-[11px] text-center`}>탭하면 가능 → 피하고 싶음 → 안 되는 시간 → 해제 순으로 바뀌어요 · 드래그로 한 번에 지정</p>
+      {neededSlotsFor(meeting.durationLabel) > 1 && (
+        <p className={`${T.mutedForeground} text-[11px] text-center`}>
+          이 회의는 {DURATION_LABEL_TEXT[meeting.durationLabel]}짜리라, 빈 칸을 "가능"으로 처음 탭하면 이어지는 {neededSlotsFor(meeting.durationLabel)}칸이 한 번에 채워져요.
+        </p>
+      )}
       {/* 잠금 출처 캡션 (발견 28 — PRD 3.2) */}
       <p className={`${T.mutedForeground} text-xs text-center`}>회색으로 잠긴 시간은 연결된 캘린더에 이미 있는 일정이에요 (이동 시간 포함, 자동으로 반영돼요)</p>
 
@@ -1252,7 +1323,7 @@ function AttendeeScreen() {
       <div className={`${T.background} ${T.pScreen} flex flex-col gap-4 justify-center min-h-[60vh] text-center max-w-xl mx-auto w-full`}>
         <div className={`${T.successLight} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-2`}>
           <span className={`${T.mutedForeground} text-xs`}>회의가 확정되었습니다</span>
-          <span className={`${T.foreground} text-xl font-bold`}>{fmtSlot(meeting.confirmedSlot)}</span>
+          <span className={`${T.foreground} text-xl font-bold`}>{fmtSlotRange(meeting.confirmedSlot, meeting.durationLabel)}</span>
           <span className={`${T.textSuccess} text-sm`}>{copy.main}</span>
           {copy.absentLines.map((line) => <span key={line} className={`${T.textWarning} text-xs`}>{line}</span>)}
         </div>
@@ -1277,7 +1348,7 @@ function AttendeeScreen() {
         <div className={`${T.background} ${T.pScreen} flex flex-col gap-4 justify-center min-h-[60vh] text-center max-w-xl mx-auto w-full`}>
           <div className={`${T.card} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-2`}>
             <span className={`${T.mutedForeground} text-xs`}>대체 시간 후보</span>
-            <span className={`${T.foreground} text-lg font-bold`}>{fmtSlot(quickReconfirmSlot.slotKey)}</span>
+            <span className={`${T.foreground} text-lg font-bold`}>{fmtSlotRange(quickReconfirmSlot.slotKey, meeting.durationLabel)}</span>
             <span className={`${T.mutedForeground} text-sm`}>{me?.name}님은 이미 이 시간에 응답한 적이 있어요. 여전히 가능하신가요?</span>
           </div>
           <button className={`${alreadyUpdated ? `${T.card} border ${T.border} ${T.mutedForeground}` : `${T.primary} ${T.primaryForeground}`} w-full py-3 ${T.roundedElement} text-sm font-bold ${T.pressed} ${alreadyUpdated ? T.disabled : ""}`}
@@ -1402,7 +1473,7 @@ function HostDashboardScreen() {
       <div className={`${T.background} ${T.pScreen} flex flex-col gap-4 min-h-screen max-w-xl mx-auto w-full`}>
         <div className={`${T.successLight} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-3 text-center`}>
           <span className={`${T.mutedForeground} text-xs`}>회의 확정 완료</span>
-          <span className={`${T.foreground} text-3xl font-bold`}>{fmtSlot(meeting.confirmedSlot)}</span>
+          <span className={`${T.foreground} text-3xl font-bold`}>{fmtSlotRange(meeting.confirmedSlot, meeting.durationLabel)}</span>
           <span className={`${T.textSuccess} text-sm`}>{copy.main}</span>
           {copy.absentLines.map((line) => <span key={line} className={`${T.textWarning} text-xs`}>{line}</span>)}
           <button className={`${T.primary} ${T.primaryForeground} w-full py-3 ${T.roundedElement} text-sm font-bold ${T.pressed}`}
@@ -1850,7 +1921,7 @@ export default function App() {
       track("attendance_cancelled", meeting.meetingId, { dropout_reason: "SELF_CANCEL" });
       // v2.4 개정(발견 89) — 취소=대안선택 강제: 대기 화면을 거치지 않고 곧바로 원클릭/그리드로 진입한다.
       // canQuickReconfirm(등)은 이전 렌더의 stale 클로저이므로, 방금 만든 next를 기준으로 직접 재계산한다.
-      const nextTop3 = calculateBestTime(next.availability, next.members, { excludeIds: [], slots: activeSlots(next.candidatePeriod) });
+      const nextTop3 = calculateBestTime(next.availability, next.members, { excludeIds: [], slots: activeSlots(next.candidatePeriod), durationLabel: next.durationLabel });
       const topSlot = nextTop3.length && nextTop3[0].level !== 3 ? nextTop3[0] : null;
       const eligible = topSlot && ["AVAILABLE", "AVOID"].includes((next.availability[id] || {})[topSlot.slotKey]);
       selectMember(id);
@@ -1939,7 +2010,7 @@ export default function App() {
   // v2.3 신규 — 제출 직전 판정: 본인의 응답이 유일한 병목이면 조용히 재고 기회를 준다 (PRD 5.3 [PRD-PROACTIVE])
   const checkProactiveNudge = (buffer) => {
     const projected = { ...meeting.availability, [currentMemberId]: buffer };
-    const result = calculateBestTime(projected, meeting.members, { slots: activeSlots(meeting.candidatePeriod) });
+    const result = calculateBestTime(projected, meeting.members, { slots: activeSlots(meeting.candidatePeriod), durationLabel: meeting.durationLabel });
     const top = result[0];
     const me = meeting.members.find((m) => m.id === currentMemberId);
     if (top && top.level === 2 && top.subNames.length === 1 && top.subNames[0] === me?.name) return top;
@@ -2014,14 +2085,31 @@ export default function App() {
       return { ...prev, [currentMemberId]: g };
     });
   };
+  // 연속 슬롯 여러 칸을 한 번에 칠한다 — BLOCK_STRICT(외부 캘린더 잠김) 칸만 건너뛰고 나머지는 채운다.
+  const paintSpan = (span, state) => {
+    setTempGrid((prev) => {
+      const g = { ...(prev[currentMemberId] || {}) };
+      span.forEach((sk) => { if (g[sk] !== "BLOCK_STRICT") g[sk] = state; });
+      return { ...prev, [currentMemberId]: g };
+    });
+  };
   const onSlotDown = (sk) => {
     const g = tempGrid[currentMemberId] || {};
     if (g[sk] === "BLOCK_STRICT") {
       showToast(`이 시간엔 안 돼요: ${meeting.blockReasons[currentMemberId] || "기존 일정"}`); // 실제 일정명 (발견 28)
       return;
     }
-    const next = cycleState(g[sk]);
+    const prevVal = g[sk];
+    const next = cycleState(prevVal);
     dragRef.current = { active: true, apply: next === undefined ? "AVAILABLE" : next };
+    // 처음(아직 안 정함) "가능"으로 답하는 탭이면, 회의 길이만큼 연속 칸을 한 번에 채운다 — 참석자가
+    // 한 시간만 보고 "가능"이라 답했다가 뒤 시간에 실제로 일정이 있는 걸 놓치는 걸 방지한다.
+    // 드래그로 이어 칠할 때(onSlotEnter)는 각 칸을 개별로 다루고, 이미 답이 있는 칸을 다시 탭할 때도
+    // (기존 답 미세 조정 목적이므로) 블록으로 안 퍼지고 그 칸만 순환한다.
+    if (next === "AVAILABLE" && prevVal === undefined) {
+      const span = slotSpan(sk, neededSlotsFor(meeting.durationLabel));
+      if (span && span.length > 1) { paintSpan(span, "AVAILABLE"); return; }
+    }
     paintSlot(sk, next);
   };
   const onSlotEnter = (sk) => { if (dragRef.current.active) paintSlot(sk, dragRef.current.apply); };
@@ -2061,7 +2149,7 @@ export default function App() {
   const top3 = useMemo(() => {
     if (meeting.status !== "PROGRESS" || dl.shouldBlockResult) return [];
     const excludeIds = meeting.forceClosed ? dl.pendingIds : [];
-    return calculateBestTime(meeting.availability, meeting.members, { excludeIds, slots: activeSlots(meeting.candidatePeriod) });
+    return calculateBestTime(meeting.availability, meeting.members, { excludeIds, slots: activeSlots(meeting.candidatePeriod), durationLabel: meeting.durationLabel });
   }, [meeting, dl.shouldBlockResult]); // eslint-disable-line
   const currentTop3Ref = useRef([]);
   currentTop3Ref.current = top3;
@@ -2069,7 +2157,7 @@ export default function App() {
     if (meeting.status !== "CONFLICT") return [];
     // v2.3 개정(발견 87): 경로 A·B·C 전부 excludeIds 미사용, 본인 포함 전원 기준으로 재연산한다.
     // 각 경로의 확정 슬롯 자동 마킹(UNAVAILABLE 또는 BLOCK_STRICT)만으로 그 슬롯이 자연히 후보에서 빠진다.
-    return calculateBestTime(meeting.availability, meeting.members, { excludeIds: [], slots: activeSlots(meeting.candidatePeriod) });
+    return calculateBestTime(meeting.availability, meeting.members, { excludeIds: [], slots: activeSlots(meeting.candidatePeriod), durationLabel: meeting.durationLabel });
   }, [meeting]);
   // [PRD-REMATCH] 6-2C 신설(발견 89) — 원클릭 재확인 대상 판정: CONFLICT 진입 후 1순위 추천 슬롯이 이미 전원(또는
   // 선택 참석자 제외 전원) 커버된 상태(level 0~2)라면, 그 슬롯에 대해 본인 기존 데이터가 이미
