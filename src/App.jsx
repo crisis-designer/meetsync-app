@@ -657,7 +657,7 @@ function ConfirmArea({ history, sentence, extra, cancelLabel = "취소", execLab
 // [DS-FLOW-D01-RESULT] 추천 카드 (D01·R01 공용) — CF01 확정 + 교착 해소 위계 (PRD 5.1)
 // v2.2(발견 84): gate prop — R01에서만 전달. { blocked, message } — blocked면 레벨 무관하게 확정 버튼 대신 안내 노출
 function RecommendList({ items, gate }) {
-  const { newCardKeys, meeting, dl, confirmOpen, setConfirmOpen, handleConfirmMeeting, sendReRequest, demoteNoteDraft, setDemoteNoteDraft, demoteMember, extendPeriod } = useApp();
+  const { newCardKeys, meeting, dl, confirmOpen, setConfirmOpen, handleConfirmMeeting, sendReRequest, demoteNoteDraft, setDemoteNoteDraft, demoteMember, extendPeriod, isHost } = useApp();
   return (
     <div className="flex flex-col gap-2">
       {items.map((slot, rank) => {
@@ -686,23 +686,31 @@ function RecommendList({ items, gate }) {
                 <span className={`text-xs font-medium ${slot.tone === "ok" ? T.textSuccess : slot.tone === "warn" ? T.textWarning : T.textDestructive}`}>{slot.label}</span>
                 {slot.subline && <span className={`${T.mutedForeground} text-xs`}>{slot.subline}</span>}
               </div>
-              {/* 불변식(PRD 2.7): 부분 성립 카드에는 확정 버튼 자체가 없다. v2.2(발견 84): gate.blocked면 레벨 무관하게 버튼 대신 안내 */}
+              {/* 불변식(PRD 2.7): 부분 성립 카드에는 확정 버튼 자체가 없다. v2.2(발견 84): gate.blocked면 레벨 무관하게 버튼 대신 안내.
+                  주최자 전용(발견 100) — 링크로 화면 자체는 누구나 볼 수 있지만, 확정 조작은 주최자만 할 수 있어야 한다. */}
               {slot.level < 3 && (
                 gate?.blocked ? (
                   <span className={`${T.mutedForeground} text-xs text-right shrink-0`}>모든 필수 참석자가<br />갱신하면 확정할 수 있어요</span>
-                ) : (
+                ) : isHost ? (
                   <button className={`${T.primary} ${T.primaryForeground} px-4 py-2 ${T.roundedElement} text-xs font-bold ${T.pressed} shrink-0`}
                     onClick={() => setConfirmOpen({ type: "CONFIRM", slotKey: slot.slotKey })}>최종 확정</button>
+                ) : (
+                  <span className={`${T.mutedForeground} text-xs text-right shrink-0`}>주최자만<br />확정할 수 있어요</span>
                 )
               )}
             </div>
 
-            {cfConfirm && (
+            {isHost && cfConfirm && (
               <ConfirmArea sentence={confirmSentence} execLabel="이 시간으로 확정" onExec={() => handleConfirmMeeting(slot.slotKey)} />
             )}
 
-            {/* [DS-FLOW-D01-DEADLOCK] level 3 — 갈림길 (PRD 5.1, v2.3: 기간 확장 액션 추가) */}
-            {slot.level === 3 && (
+            {/* [DS-FLOW-D01-DEADLOCK] level 3 — 갈림길 (PRD 5.1, v2.3: 기간 확장 액션 추가). 아래 조작들(재요청·강등·기간확장)도 주최자 전용. */}
+            {slot.level === 3 && !isHost && (
+              <div className={`border-t ${T.border} pt-2`}>
+                <span className={`${T.mutedForeground} text-xs`}>주최자만 여기서 다시 요청하거나 조율할 수 있어요.</span>
+              </div>
+            )}
+            {slot.level === 3 && isHost && (
               <div className={`border-t ${T.border} pt-2 flex flex-col gap-2`}>
                 {hostBottleneck ? (
                   <span className={`${T.mutedForeground} text-xs`}>주최자님이 직접 시간을 다시 골라야 해요 — 참석자 화면에서 김주최로 들어가 다시 알려주세요.</span>
@@ -1466,7 +1474,7 @@ function HostDashboardScreen() {
     meeting, resetMeeting, confirmOpen, setConfirmOpen, submittedCount, dl, top3, syncChecking, nameOf,
     rejectPromotionRequest, approvePromotionRequest, rejectReinstateRequest, approveReinstateRequest,
     showToast, navigate, cancelReasonDraft, setCancelReasonDraft, cancelMeeting, nudge, forceCloseExec,
-    registrationCopy, inviteLink,
+    registrationCopy, inviteLink, isHost,
   } = useApp();
 
   if (meeting.status === "CANCELLED") { // v2.3 — 최우선 가드
@@ -1528,12 +1536,16 @@ function HostDashboardScreen() {
             {nameOf(pendingPromotion.id)}님이 참조자 전환을 요청했어요
             {pendingPromotion.reason && <span className={`block ${T.mutedForeground} font-normal mt-0.5`}>사유: {pendingPromotion.reason}</span>}
           </span>
-          <div className="flex gap-2 shrink-0">
-            <button className={`${T.card} border ${T.border} ${T.foreground} px-3 py-1.5 ${T.roundedElement} text-xs ${T.pressed}`}
-              onClick={() => rejectPromotionRequest(pendingPromotion.id)}>거절</button>
-            <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs font-bold ${T.pressed}`}
-              onClick={() => approvePromotionRequest(pendingPromotion.id)}>승인</button>
-          </div>
+          {isHost ? (
+            <div className="flex gap-2 shrink-0">
+              <button className={`${T.card} border ${T.border} ${T.foreground} px-3 py-1.5 ${T.roundedElement} text-xs ${T.pressed}`}
+                onClick={() => rejectPromotionRequest(pendingPromotion.id)}>거절</button>
+              <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs font-bold ${T.pressed}`}
+                onClick={() => approvePromotionRequest(pendingPromotion.id)}>승인</button>
+            </div>
+          ) : (
+            <span className={`${T.mutedForeground} text-xs shrink-0`}>주최자 확인 대기 중</span>
+          )}
         </div>
       )}
       {/* 필수 복귀 요청 배너 (v2.5 신규 — PRD 5.1 [PRD-REINSTATE-REQUEST], 발견 81) — 역강등 요청과 동시 대기 시 별도 배너로 각각 노출 */}
@@ -1543,12 +1555,16 @@ function HostDashboardScreen() {
             {nameOf(pendingReinstate.id)}님이 다시 필수 참석자가 되고 싶다고 요청했어요
             {pendingReinstate.reason && <span className={`block ${T.mutedForeground} font-normal mt-0.5`}>사유: {pendingReinstate.reason}</span>}
           </span>
-          <div className="flex gap-2 shrink-0">
-            <button className={`${T.card} border ${T.border} ${T.foreground} px-3 py-1.5 ${T.roundedElement} text-xs ${T.pressed}`}
-              onClick={() => rejectReinstateRequest(pendingReinstate.id)}>거절</button>
-            <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs font-bold ${T.pressed}`}
-              onClick={() => approveReinstateRequest(pendingReinstate.id)}>승인</button>
-          </div>
+          {isHost ? (
+            <div className="flex gap-2 shrink-0">
+              <button className={`${T.card} border ${T.border} ${T.foreground} px-3 py-1.5 ${T.roundedElement} text-xs ${T.pressed}`}
+                onClick={() => rejectReinstateRequest(pendingReinstate.id)}>거절</button>
+              <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs font-bold ${T.pressed}`}
+                onClick={() => approveReinstateRequest(pendingReinstate.id)}>승인</button>
+            </div>
+          ) : (
+            <span className={`${T.mutedForeground} text-xs shrink-0`}>주최자 확인 대기 중</span>
+          )}
         </div>
       )}
       <div className={`${T.card} ${T.border} ${T.roundedContainer} ${T.pCard} border flex flex-col gap-2`}>
@@ -1561,40 +1577,48 @@ function HostDashboardScreen() {
             onClick={() => navigate("/attendee")}>링크 열어보기</button>
         </div>
       </div>
-      {/* [DS-FLOW-D01-CANCEL] 회의 취소 (v2.3 신설 — PRD 5.6) */}
-      <button className={`${T.mutedForeground} text-xs underline text-left ${T.pressed}`}
-        onClick={() => setConfirmOpen(cfCancelMeeting ? null : { type: "CANCEL_MEETING" })}>이 회의 취소하기</button>
-      {cfCancelMeeting && (
-        <ConfirmArea
-          sentence="이 회의를 취소합니다. 모든 참석자가 더 이상 이 링크로 일정을 조율하거나 확인할 수 없게 됩니다."
-          execLabel="회의 취소하기" onExec={() => cancelMeeting(cancelReasonDraft)}
-          extra={<input className={`${T.card} border ${T.border} ${T.roundedElement} p-2 text-xs w-full`}
-            placeholder="취소 사유 (참석자에게 표시됩니다, 선택)" defaultValue={cancelReasonDraft} onChange={(e) => setCancelReasonDraft(e.target.value)} />}
-        />
+      {/* [DS-FLOW-D01-CANCEL] 회의 취소 (v2.3 신설 — PRD 5.6) — 주최자 전용 */}
+      {isHost && (
+        <>
+          <button className={`${T.mutedForeground} text-xs underline text-left ${T.pressed}`}
+            onClick={() => setConfirmOpen(cfCancelMeeting ? null : { type: "CANCEL_MEETING" })}>이 회의 취소하기</button>
+          {cfCancelMeeting && (
+            <ConfirmArea
+              sentence="이 회의를 취소합니다. 모든 참석자가 더 이상 이 링크로 일정을 조율하거나 확인할 수 없게 됩니다."
+              execLabel="회의 취소하기" onExec={() => cancelMeeting(cancelReasonDraft)}
+              extra={<input className={`${T.card} border ${T.border} ${T.roundedElement} p-2 text-xs w-full`}
+                placeholder="취소 사유 (참석자에게 표시됩니다, 선택)" defaultValue={cancelReasonDraft} onChange={(e) => setCancelReasonDraft(e.target.value)} />}
+            />
+          )}
+        </>
       )}
 
       {dl.alertBannerActive && (
         <div className={`${T.destructiveLight} ${T.borderDestructive} ${T.textDestructive} ${T.pCard} ${T.roundedElement} border text-sm flex flex-col gap-2`}>
           <span>아직 답 안 한 필수 참석자: {dl.pendingList.join(", ")}. 마감을 미루고 있어요.</span>
-          <div className="flex gap-2">
-            <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs ${T.pressed}`}
-              onClick={() => nudge(dl.pendingIds)}>다시 알림 보내기</button>
-            <button className={`${T.card} ${T.border} ${T.foreground} px-3 py-1.5 ${T.roundedElement} border text-xs ${T.pressed}`}
-              onClick={() => setConfirmOpen(cfForce ? null : { type: "FORCE_CLOSE" })}>빼고 마감하기</button>
-          </div>
-          {/* [PRD 5.3] 강제 마감 확인 영역 — 독촉 이력 표기 (2.7-②) */}
-          {cfForce && (
-            <ConfirmArea
-              history={allNudged
-                ? <span className={`${T.mutedForeground} text-xs`}>이미 알림 보냈어요 ✓ · 아직 답 없음</span>
-                : <div className="flex justify-between items-center gap-2">
-                    <span className={`${T.textWarning} text-xs`}>{dl.pendingList.join(", ")}님에게 아직 알림을 안 보냈어요</span>
-                    <button className={`${T.card} border ${T.border} ${T.foreground} px-2 py-1 ${T.roundedElement} text-xs ${T.pressed} shrink-0`}
-                      onClick={() => nudge(dl.pendingIds)}>먼저 알림 보내기</button>
-                  </div>}
-              sentence={`${dl.pendingList.join(", ")}님을 빼고 결과를 계산해요. 나중에 제출하면 자동으로 다시 포함돼요.`}
-              execLabel="빼고 마감하기" onExec={forceCloseExec}
-            />
+          {isHost && (
+            <>
+              <div className="flex gap-2">
+                <button className={`${T.primary} ${T.primaryForeground} px-3 py-1.5 ${T.roundedElement} text-xs ${T.pressed}`}
+                  onClick={() => nudge(dl.pendingIds)}>다시 알림 보내기</button>
+                <button className={`${T.card} ${T.border} ${T.foreground} px-3 py-1.5 ${T.roundedElement} border text-xs ${T.pressed}`}
+                  onClick={() => setConfirmOpen(cfForce ? null : { type: "FORCE_CLOSE" })}>빼고 마감하기</button>
+              </div>
+              {/* [PRD 5.3] 강제 마감 확인 영역 — 독촉 이력 표기 (2.7-②) */}
+              {cfForce && (
+                <ConfirmArea
+                  history={allNudged
+                    ? <span className={`${T.mutedForeground} text-xs`}>이미 알림 보냈어요 ✓ · 아직 답 없음</span>
+                    : <div className="flex justify-between items-center gap-2">
+                        <span className={`${T.textWarning} text-xs`}>{dl.pendingList.join(", ")}님에게 아직 알림을 안 보냈어요</span>
+                        <button className={`${T.card} border ${T.border} ${T.foreground} px-2 py-1 ${T.roundedElement} text-xs ${T.pressed} shrink-0`}
+                          onClick={() => nudge(dl.pendingIds)}>먼저 알림 보내기</button>
+                      </div>}
+                  sentence={`${dl.pendingList.join(", ")}님을 빼고 결과를 계산해요. 나중에 제출하면 자동으로 다시 포함돼요.`}
+                  execLabel="빼고 마감하기" onExec={forceCloseExec}
+                />
+              )}
+            </>
           )}
         </div>
       )}
@@ -1697,6 +1721,10 @@ function ReMatchScreen() {
 export default function App() {
   const [meeting, setMeeting] = useState(loadInitialState);
   const [currentPath, setCurrentPath] = useState(pathFromUrl);
+  // URL에 ?m=이 있는데 아직 그 회의를 못 받아왔을 때 — 이 상태가 풀리기 전까진 라우팅 가드가
+  // 로컬의 빈 초기 상태(launched:false)만 보고 성급하게 "/host/create"로 리다이렉트하면서
+  // URL의 m= 값까지 지워버려, 정작 그 회의를 받아올 방법이 없어지는 경쟁 상태가 있었다.
+  const [linkResolved, setLinkResolved] = useState(() => !new URLSearchParams(window.location.search).get("m"));
   const [attendeeStage, setAttendeeStage] = useState("INVITE");
   const [currentMemberId, setCurrentMemberId] = useState(null);
   const [tempGrid, setTempGrid] = useState({});
@@ -1757,9 +1785,10 @@ export default function App() {
     setNewCardKeys([]);
   };
   useEffect(() => {
+    if (!linkResolved) return; // ?m= 회의를 아직 못 받아온 상태에선 빈 로컬 상태 기준으로 성급하게 리다이렉트하지 않는다
     const r = resolveRoute(currentPath, meeting);
     if (r !== currentPath) goTo(r, { replace: true }); // 자동 보정(가드) — 새 히스토리를 쌓지 않고 대체
-  }, [meeting.status, meeting.launched]); // eslint-disable-line
+  }, [meeting.status, meeting.launched, linkResolved]); // eslint-disable-line
   // 상태 전이 시 탐색 상태 리셋 — COMPLETED 위계 준수 (발견 36 부수)
   useEffect(() => {
     setHeatOpen(false); setHeatSelected(null); setConfirmOpen(null); setCancelStage(null);
@@ -1797,6 +1826,7 @@ export default function App() {
     if (!mId) return;
     const mine = isHostedByMe(mId); // STORAGE_KEY 캐시가 아니라 발의 이력으로 판별 — 응답 제출한 참석자와 구분
     supabase.from("meetings").select("data").eq("id", mId).single().then(({ data, error }) => {
+      setLinkResolved(true); // 성공/실패 무관 — 시도 자체는 끝났으니 라우팅 가드를 다시 정상 동작시킨다
       if (error || !data) return; // 잘못된 링크거나 아직 동기화 전 — 로컬 상태 그대로 둔다
       setMeeting(data.data);
       // resolveRoute를 방금 받아온 실제 상태(data.data) 기준으로 직접 호출한다 — meeting 상태 변경과 경로 변경이
@@ -2191,6 +2221,9 @@ export default function App() {
   };
   const heatmap = useMemo(() => buildHeatmap(meeting), [meeting]);
   const hostName = meeting.members.find((m) => m.role === "HOST").name;
+  // 이 브라우저가 실제로 이 회의를 발의했는지 — 주최자 화면은 누구나 링크로 "볼" 수 있어도,
+  // 조작(확정·취소·강제마감·요청 승인 등)은 주최자만 할 수 있어야 한다.
+  const isHost = isHostedByMe(meeting.meetingId);
   const inviteLink = typeof window !== "undefined"
     ? `${window.location.origin}${window.location.pathname}?m=${meeting.meetingId}`
     : "";
@@ -2246,7 +2279,7 @@ export default function App() {
     checkProactiveNudge, submitAvailability,
     selectMember, cycleState, paintSlot, onSlotDown, onSlotEnter, onGridTouchMove, fillRemaining, fillDayUnavailable,
     dl, submittedCount, top3, currentTop3Ref, rematchTop3, quickReconfirmSlot, canQuickReconfirm, heatmap, hostName, step,
-    isProductScreen, isHostScreen, nameOf, registrationCopy, inviteLink,
+    isProductScreen, isHostScreen, nameOf, registrationCopy, inviteLink, isHost,
   };
 
   return (
